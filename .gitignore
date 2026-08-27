@@ -1,0 +1,79 @@
+# Windows / editor
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+
+# Local environment
+.env*
+*.local
+*.log
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# Backend generated output
+backend/output/
+
+# Local automation and temporary work
+tmp/
+.playwright-mcp/
+.run/
+.codegraph/
+
+# Office lock and recovery files
+~$*.docx
+~$*.xlsx
+~$*.pptx
+
+# Git worktrees used by local development only
+.worktrees/
+worktrees/
+
+# This repository publishes the runnable product only.
+/.codex/
+/docs/
+/scripts/
+/skills/
+/tests/
+/AGENTS.md
+/CONCEPTS.md
+/STRATEGY.md
+/workspace-policy.json
+/README.md
+/SECURITY.md
+/LICENSE
+/.gitattributes
+
+# Backend development, validation, documentation, and offline-only helpers
+/backend/AGENTS.md
+/backend/README.md
+/backend/docs/
+/backend/examples/
+/backend/scripts/
+/backend/tests/
+/backend/tmp/
+/backend/validation_tests/
+/backend/src/cable_tension/case_presets.py
+/backend/src/cable_tension/io.py
+
+# Frontend tests, documentation, and unused historical screens
+/frontend/AGENTS.md
+/frontend/README.md
+/frontend/public/examples/
+/frontend/src/**/*.test.ts
+/frontend/src/**/*.test.tsx
+/frontend/src/test/
+/frontend/src/SimulationParameterPanel.tsx
+/frontend/src/SimulationResultView.tsx
+/frontend/src/materialInput.ts

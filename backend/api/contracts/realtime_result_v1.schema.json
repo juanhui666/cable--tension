@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Realtime Cable Result v1",
+  "description": "The single result structure returned by session initialization and every accepted update.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "session_id",
+    "sequence",
+    "time_s",
+    "cable_shape",
+    "tensions",
+    "minimum_bend_radius",
+    "runtime"
+  ],
+  "properties": {
+    "session_id": {"type": "string", "minLength": 1},
+    "sequence": {"type": "integer", "minimum": 0},
+    "time_s": {"type": "number", "minimum": 0},
+    "cable_shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["points", "segment_tensions_n"],
+      "properties": {
+        "points": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"$ref": "#/$defs/point"}
+        },
+        "segment_tensions_n": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "number", "minimum": 0}
+        }
+      }
+    },
+    "tensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "top_tension_n",
+        "plough_inlet_tension_n",
+        "measured_top_tension_n",
+        "top_tension_residual_n"
+      ],
+      "properties": {
+        "top_tension_n": {"type": "number", "minimum": 0},
+        "plough_inlet_tension_n": {"type": "number", "minimum": 0},
+        "measured_top_tension_n": {"type": ["number", "null"], "minimum": 0},
+        "top_tension_residual_n": {"type": ["number", "null"]}
+      }
+    },
+    "minimum_bend_radius": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum_m", "limit_m", "margin_m", "status"],
+      "properties": {
+        "minimum_m": {"type": ["number", "null"], "minimum": 0},
+        "limit_m": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "margin_m": {"type": ["number", "null"]},
+        "status": {
+          "type": "string",
+          "enum": ["not_configured", "not_available", "ok", "below_limit"]
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["compute_wall_s", "realtime_factor"],
+      "properties": {
+        "compute_wall_s": {"type": "number", "minimum": 0},
+        "realtime_factor": {"type": ["number", "null"], "exclusiveMinimum": 0}
+      }
+    }
+  },
+  "$defs": {
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "x_m", "y_m", "z_m"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "x_m": {"type": "number"},
+        "y_m": {"type": "number"},
+        "z_m": {"type": "number", "minimum": 0}
+      }
+    }
+  }
+}

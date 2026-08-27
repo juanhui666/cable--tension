@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Realtime Sensor Packet v1",
+  "description": "One synchronized engineering packet for a fixed 1 s realtime update.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sequence",
+    "time_s",
+    "vessel",
+    "payout_speed_mps",
+    "surface_current"
+  ],
+  "properties": {
+    "sequence": {"type": "integer", "minimum": 0},
+    "time_s": {"type": "number", "minimum": 0},
+    "vessel": {"$ref": "#/$defs/vesselMotion"},
+    "payout_speed_mps": {"type": "number", "minimum": 0},
+    "surface_current": {"$ref": "#/$defs/horizontalVelocity"},
+    "plough_position": {"$ref": "#/$defs/position"},
+    "measured_top_tension_n": {"type": "number", "minimum": 0}
+  },
+  "$defs": {
+    "position": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x_m", "y_m", "z_m"],
+      "properties": {
+        "x_m": {"type": "number"},
+        "y_m": {"type": "number"},
+        "z_m": {"type": "number", "minimum": 0}
+      }
+    },
+    "horizontalVelocity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["velocity_x_mps", "velocity_y_mps"],
+      "properties": {
+        "velocity_x_mps": {"type": "number"},
+        "velocity_y_mps": {"type": "number"}
+      }
+    },
+    "vesselMotion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x_m",
+        "y_m",
+        "z_m",
+        "velocity_x_mps",
+        "velocity_y_mps",
+        "velocity_z_mps"
+      ],
+      "properties": {
+        "x_m": {"type": "number"},
+        "y_m": {"type": "number"},
+        "z_m": {"type": "number"},
+        "velocity_x_mps": {"type": "number"},
+        "velocity_y_mps": {"type": "number"},
+        "velocity_z_mps": {"type": "number"}
+      }
+    }
+  }
+}

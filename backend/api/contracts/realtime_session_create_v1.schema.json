@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Realtime Session Initialization v1",
+  "description": "Engineering material, environment, initial geometry and the sequence=0 measurement packet.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["cable", "environment", "initial_geometry", "initial_packet"],
+  "properties": {
+    "cable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diameter_m",
+        "mass_air_kg_per_m",
+        "tangential_drag_coefficient",
+        "normal_drag_coefficient",
+        "axial_stiffness_n"
+      ],
+      "properties": {
+        "diameter_m": {"type": "number", "exclusiveMinimum": 0},
+        "mass_air_kg_per_m": {"type": "number", "exclusiveMinimum": 0},
+        "tangential_drag_coefficient": {"type": "number", "minimum": 0},
+        "normal_drag_coefficient": {"type": "number", "minimum": 0},
+        "axial_stiffness_n": {"type": "number", "exclusiveMinimum": 0},
+        "min_bending_radius_m": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["water_depth_m"],
+      "properties": {
+        "water_depth_m": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "initial_geometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "initial_suspended_length_m",
+        "plough_layback_m",
+        "plough_depth_m"
+      ],
+      "properties": {
+        "initial_suspended_length_m": {"type": "number", "exclusiveMinimum": 0},
+        "plough_layback_m": {"type": "number", "minimum": 0},
+        "plough_depth_m": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "initial_packet": {
+      "allOf": [
+        {"$ref": "./realtime-sensor-packet"},
+        {
+          "type": "object",
+          "properties": {
+            "sequence": {"const": 0},
+            "time_s": {"const": 0}
+          }
+        }
+      ]
+    }
+  }
+}

@@ -50,7 +50,6 @@ worktrees/
 /CONCEPTS.md
 /STRATEGY.md
 /workspace-policy.json
-/README.md
 /SECURITY.md
 /LICENSE
 /.gitattributes
@@ -58,6 +57,9 @@ worktrees/
 # Backend development, validation, documentation, and offline-only helpers
 /backend/AGENTS.md
 /backend/README.md
+/backend/API.md
+/backend/JSON参数说明.md
+/backend/LICENSE
 /backend/docs/
 /backend/examples/
 /backend/scripts/

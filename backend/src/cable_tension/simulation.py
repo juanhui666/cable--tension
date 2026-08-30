@@ -394,63 +394,6 @@ class TimeHistoryResult:
     plough_motion_samples: tuple[MotionSample, ...] = ()
     payout_speed_segments: tuple[SpeedSegment, ...] = ()
 
-def _material_example_case(case_name: str, cable_name: str) -> DynamicCaseInput:
-    """构造可编辑的工程示例，不替用户选择求解行为。"""
-
-    cable = get_material(cable_name)
-    values: dict[str, object] = {
-        "case_name": case_name,
-        "diameter_m": cable.diameter_m,
-        "weight_air_n_per_m": cable.weight_air_n_per_m,
-        "submerged_weight_n_per_m": cable.submerged_weight_n_per_m,
-        "tangential_drag_coefficient": cable.tangential_drag_coefficient,
-        "normal_drag_coefficient": cable.normal_drag_coefficient,
-        "axial_stiffness_n": cable.axial_stiffness_n,
-        "min_bending_radius_m": cable.min_bending_radius_m,
-        "current_speed_mps": 1.5,
-        "current_bottom_speed_mps": 0.0,
-        "current_profile_exponent": 2.0,
-        "current_direction_deg": 90.0,
-        "speed_change": "steady",
-        "vessel_initial_speed_mps": 0.514,
-        "vessel_final_speed_mps": 0.514,
-        "payout_initial_speed_mps": 0.514,
-        "payout_final_speed_mps": 0.514,
-        "length_boundary_source": "known_plough_trajectory",
-        "transition_duration_s": 120.0,
-        "total_duration_s": 120.0,
-        "water_depth_m": 80.0,
-        "element_count": 48,
-        "integration_time_step_max_s": 0.01,
-        "vessel_initial_x_m": 0.0,
-        "vessel_initial_y_m": 0.0,
-        "vessel_heading_deg": 0.0,
-        "plough_initial_x_m": -20.74971026,
-        "plough_initial_y_m": 0.0,
-        "plough_initial_z_m": 79.0,
-        "plough_speed_mps": 0.514,
-        "plough_heading_deg": 0.0,
-        "initial_suspended_length_m": 85.057647044,
-    }
-    return DynamicCaseInput(**values)
-
-_MATERIAL_EXAMPLES = {
-    "material_power_500kv": _material_example_case(
-        "material_power_500kv", "POWER_500KV"
-    ),
-}
-
-MATERIAL_EXAMPLE_CASES: tuple[str, ...] = (
-    "material_power_500kv",
-)
-
-def get_time_history_case(case_name: str) -> DynamicCaseInput:
-    """返回一个可编辑材料示例。"""
-
-    if case_name not in _MATERIAL_EXAMPLES:
-        raise KeyError(f"unknown time-history case: {case_name}")
-    return _MATERIAL_EXAMPLES[case_name]
-
 def cable_parameters_from_dynamic_case(case: DynamicCaseInput) -> CableParameters:
     """仅构造已知犁轨迹求解器实际使用的材料字段。"""
 

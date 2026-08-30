@@ -11,7 +11,6 @@ import json
 import math
 import re
 import sys
-import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,12 +25,14 @@ sys.path.insert(0, str(BACKEND_ROOT / "src"))
 from cable_tension import __version__ as MODULE_VERSION  # noqa: E402
 from cable_tension.dynamic_laying import CableGeometryInfeasibleError  # noqa: E402
 from cable_tension.realtime import (  # noqa: E402
-    REALTIME_MAX_DATA_AGE_S,
+    PassivePloughDomainError,
     REALTIME_MAX_SENSOR_GAP_S,
     RealtimeSensorPacket,
     RealtimeSessionError,
     RealtimeSessionRegistry,
     SynchronizedEndpointSample,
+    passive_plough_forward_speed,
+    passive_plough_kinematic_samples,
 )
 from cable_tension.simulation import DynamicCaseInput  # noqa: E402
 
@@ -49,6 +50,7 @@ _REALTIME_ELEMENT_COUNT = 48
 _REALTIME_INTEGRATION_TIME_STEP_MAX_S = 0.01
 _REALTIME_CURRENT_BOTTOM_SPEED_MPS = 0.0
 _REALTIME_CURRENT_PROFILE_EXPONENT = 2.0
+_SPEED_EPSILON_MPS = 1.0e-12
 
 
 @dataclass(frozen=True)
@@ -70,14 +72,18 @@ class _RealtimeSetup:
 
 @dataclass(frozen=True)
 class _PloughBoundaryState:
-    """最近一次成功接受的犁边界及其固定后拖参数。"""
+    """最近一次成功接受的犁边界及被动拖曳状态。"""
 
     horizontal_offset_x_m: float
     horizontal_offset_y_m: float
+    horizontal_layback_m: float
+    heading_rad: float
     depth_m: float
     position_x_m: float
     position_y_m: float
     position_z_m: float
+    vessel_velocity_x_mps: float
+    vessel_velocity_y_mps: float
     time_s: float
 
 
@@ -174,7 +180,6 @@ class CableApiServer:
                 base_case=base_case,
                 initial_packet=packet,
                 max_sensor_gap_s=REALTIME_MAX_SENSOR_GAP_S,
-                max_data_age_s=REALTIME_MAX_DATA_AGE_S,
             )
         except RealtimeSessionError as exc:
             return _realtime_error_response(exc)
@@ -368,29 +373,78 @@ def _parse_public_packet(
     assert sequence is not None and time_s is not None and payout_speed is not None
     assert vessel is not None and current_x is not None and current_y is not None
 
-    if measured_position is None:
-        offset_x, offset_y, depth = default_plough_boundary
-        position_x = vessel.x_m + offset_x
-        position_y = vessel.y_m + offset_y
-        position_z = depth
-        velocity_x = vessel.velocity_x_mps
-        velocity_y = vessel.velocity_y_mps
-        velocity_z = 0.0
-    else:
-        position_x, position_y, position_z = measured_position
-        offset_x = position_x - vessel.x_m
-        offset_y = position_y - vessel.y_m
-        depth = position_z
-        if previous_plough_state is None or time_s <= previous_plough_state.time_s:
-            # 初始化显式犁位没有可用历史，水平速度按固定后拖取船速。
-            velocity_x = vessel.velocity_x_mps
-            velocity_y = vessel.velocity_y_mps
+    try:
+        if measured_position is None:
+            offset_x, offset_y, depth = default_plough_boundary
+            if previous_plough_state is None:
+                layback = math.hypot(offset_x, offset_y)
+                heading = _initial_plough_heading(
+                    offset_x,
+                    offset_y,
+                    vessel.velocity_x_mps,
+                    vessel.velocity_y_mps,
+                )
+            else:
+                layback = previous_plough_state.horizontal_layback_m
+                heading = _advance_passive_plough_heading(
+                    previous_plough_state,
+                    vessel.velocity_x_mps,
+                    vessel.velocity_y_mps,
+                    time_s,
+                )
+            offset_x = -layback * math.cos(heading)
+            offset_y = -layback * math.sin(heading)
+            position_x = vessel.x_m + offset_x
+            position_y = vessel.y_m + offset_y
+            position_z = depth
+            plough_speed = _passive_plough_speed(
+                vessel.velocity_x_mps,
+                vessel.velocity_y_mps,
+                heading,
+            )
+            velocity_x = plough_speed * math.cos(heading)
+            velocity_y = plough_speed * math.sin(heading)
             velocity_z = 0.0
         else:
-            time_step_s = time_s - previous_plough_state.time_s
-            velocity_x = (position_x - previous_plough_state.position_x_m) / time_step_s
-            velocity_y = (position_y - previous_plough_state.position_y_m) / time_step_s
-            velocity_z = (position_z - previous_plough_state.position_z_m) / time_step_s
+            position_x, position_y, position_z = measured_position
+            offset_x = position_x - vessel.x_m
+            offset_y = position_y - vessel.y_m
+            layback = math.hypot(offset_x, offset_y)
+            depth = position_z
+            if previous_plough_state is None or time_s <= previous_plough_state.time_s:
+                heading = _initial_plough_heading(
+                    offset_x,
+                    offset_y,
+                    vessel.velocity_x_mps,
+                    vessel.velocity_y_mps,
+                )
+                plough_speed = _passive_plough_speed(
+                    vessel.velocity_x_mps,
+                    vessel.velocity_y_mps,
+                    heading,
+                )
+                velocity_x = plough_speed * math.cos(heading)
+                velocity_y = plough_speed * math.sin(heading)
+                velocity_z = 0.0
+            else:
+                time_step_s = time_s - previous_plough_state.time_s
+                velocity_x = (position_x - previous_plough_state.position_x_m) / time_step_s
+                velocity_y = (position_y - previous_plough_state.position_y_m) / time_step_s
+                velocity_z = (position_z - previous_plough_state.position_z_m) / time_step_s
+                if math.hypot(velocity_x, velocity_y) > _SPEED_EPSILON_MPS:
+                    heading = math.atan2(velocity_y, velocity_x)
+                elif layback > _SPEED_EPSILON_MPS:
+                    heading = math.atan2(-offset_y, -offset_x)
+                else:
+                    heading = previous_plough_state.heading_rad
+    except PassivePloughDomainError as exc:
+        return _invalid_input(
+            "Realtime packet is outside the forward passive-tow domain.",
+            {
+                "vessel.velocity_x_mps": str(exc),
+                "vessel.velocity_y_mps": str(exc),
+            },
+        )
 
     plough = SynchronizedEndpointSample(
         x_m=position_x,
@@ -403,18 +457,20 @@ def _parse_public_packet(
     plough_state = _PloughBoundaryState(
         horizontal_offset_x_m=offset_x,
         horizontal_offset_y_m=offset_y,
+        horizontal_layback_m=layback,
+        heading_rad=heading,
         depth_m=depth,
         position_x_m=position_x,
         position_y_m=position_y,
         position_z_m=position_z,
+        vessel_velocity_x_mps=vessel.velocity_x_mps,
+        vessel_velocity_y_mps=vessel.velocity_y_mps,
         time_s=time_s,
     )
     return (
         RealtimeSensorPacket(
             sequence=sequence,
             time_s=time_s,
-            observed_at_unix_s=time.time(),
-            quality="valid",
             vessel=vessel,
             plough=plough,
             payout_speed_mps=payout_speed,
@@ -423,6 +479,8 @@ def _parse_public_packet(
             current_velocity_x_mps=current_x,
             current_velocity_y_mps=current_y,
             measured_top_tension_n=measured_top_tension,
+            plough_heading_rad=heading,
+            plough_layback_m=layback,
         ),
         plough_state,
     )
@@ -438,6 +496,10 @@ def _realtime_case_from_setup(
         initial_packet.vessel.velocity_x_mps,
         initial_packet.vessel.velocity_y_mps,
     )
+    plough_speed = math.hypot(
+        initial_packet.plough.velocity_x_mps,
+        initial_packet.plough.velocity_y_mps,
+    )
     current_speed = math.hypot(
         initial_packet.current_velocity_x_mps,
         initial_packet.current_velocity_y_mps,
@@ -445,6 +507,17 @@ def _realtime_case_from_setup(
     vessel_heading = _heading(
         initial_packet.vessel.velocity_x_mps,
         initial_packet.vessel.velocity_y_mps,
+    )
+    plough_heading = (
+        _heading(
+            initial_packet.plough.velocity_x_mps,
+            initial_packet.plough.velocity_y_mps,
+        )
+        if plough_speed > _SPEED_EPSILON_MPS
+        else _heading(
+            initial_packet.vessel.x_m - initial_packet.plough.x_m,
+            initial_packet.vessel.y_m - initial_packet.plough.y_m,
+        )
     )
     return DynamicCaseInput(
         case_name="realtime-session",
@@ -477,13 +550,63 @@ def _realtime_case_from_setup(
         plough_initial_x_m=initial_packet.plough.x_m,
         plough_initial_y_m=initial_packet.plough.y_m,
         plough_initial_z_m=initial_packet.plough.z_m,
-        plough_speed_mps=vessel_speed,
+        plough_speed_mps=plough_speed,
         plough_exit_speed_mps=None,
-        plough_heading_deg=vessel_heading,
+        plough_heading_deg=plough_heading,
         initial_suspended_length_m=setup.initial_suspended_length_m,
         min_bending_radius_m=setup.min_bending_radius_m,
         integration_time_step_max_s=_REALTIME_INTEGRATION_TIME_STEP_MAX_S,
     )
+
+
+def _initial_plough_heading(
+    offset_x_m: float,
+    offset_y_m: float,
+    vessel_velocity_x_mps: float,
+    vessel_velocity_y_mps: float,
+) -> float:
+    """由后拖几何确定犁艏向；零后拖时退回船速方向。"""
+
+    if math.hypot(offset_x_m, offset_y_m) > _SPEED_EPSILON_MPS:
+        return math.atan2(-offset_y_m, -offset_x_m)
+    if math.hypot(vessel_velocity_x_mps, vessel_velocity_y_mps) > _SPEED_EPSILON_MPS:
+        return math.atan2(vessel_velocity_y_mps, vessel_velocity_x_mps)
+    return 0.0
+
+
+def _passive_plough_speed(
+    vessel_velocity_x_mps: float,
+    vessel_velocity_y_mps: float,
+    plough_heading_rad: float,
+) -> float:
+    """返回前向被动拖曳适用域内的犁速。"""
+
+    return passive_plough_forward_speed(
+        vessel_velocity_x_mps,
+        vessel_velocity_y_mps,
+        plough_heading_rad,
+    )
+
+
+def _advance_passive_plough_heading(
+    previous: _PloughBoundaryState,
+    vessel_velocity_x_mps: float,
+    vessel_velocity_y_mps: float,
+    time_s: float,
+) -> float:
+    """按无横向滑移拖车方程推进犁艏向。"""
+
+    samples = passive_plough_kinematic_samples(
+        start_time_s=previous.time_s,
+        end_time_s=time_s,
+        layback_m=previous.horizontal_layback_m,
+        initial_heading_rad=previous.heading_rad,
+        start_vessel_velocity_x_mps=previous.vessel_velocity_x_mps,
+        start_vessel_velocity_y_mps=previous.vessel_velocity_y_mps,
+        end_vessel_velocity_x_mps=vessel_velocity_x_mps,
+        end_vessel_velocity_y_mps=vessel_velocity_y_mps,
+    )
+    return samples[-1].heading_rad
 
 
 def _parse_vessel(value: Any, errors: dict[str, str]) -> SynchronizedEndpointSample | None:
@@ -627,8 +750,6 @@ def _realtime_error_response(exc: RealtimeSessionError) -> ApiResponse:
         "non_monotonic_time": 409,
         "session_busy": 409,
         "sensor_gap": 422,
-        "stale_sample": 422,
-        "invalid_quality": 422,
         "invalid_packet": 400,
         "invalid_time_step": 400,
     }.get(exc.code, 400)
@@ -657,6 +778,13 @@ def create_http_handler(app: CableApiServer) -> type[BaseHTTPRequestHandler]:
     """创建带 CORS 和结构化错误的标准库 HTTP 处理器。"""
 
     class Handler(BaseHTTPRequestHandler):
+        def __getattr__(self, name: str) -> Any:
+            """将所有未公开 HTTP 方法统一交给版本化路由器拒绝。"""
+
+            if name.startswith("do_"):
+                return self._reject_unpublished_method
+            raise AttributeError(name)
+
         def do_OPTIONS(self) -> None:  # noqa: N802
             self._send(app.handle("OPTIONS", self.path))
 
@@ -669,6 +797,9 @@ def create_http_handler(app: CableApiServer) -> type[BaseHTTPRequestHandler]:
                 self._send(error_response("invalid_json", "Request body must be valid JSON.", status=400))
                 return
             self._send(app.handle("POST", self.path, payload))
+
+        def _reject_unpublished_method(self) -> None:
+            self._send(app.handle(self.command, self.path))
 
         def send_error(  # noqa: D102
             self,

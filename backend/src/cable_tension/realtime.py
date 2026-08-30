@@ -9,13 +9,11 @@ from __future__ import annotations
 
 import math
 import threading
-import time
 import uuid
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from time import perf_counter
-from typing import Callable
 
 from .simulation import (
     CurrentSample,
@@ -36,7 +34,133 @@ from .dynamic_laying import (
 CURRENT_POLAR_COMPONENT_ABS_TOLERANCE_MPS = 1.0e-9
 REALTIME_PACKET_INTERVAL_S = 1.0
 REALTIME_MAX_SENSOR_GAP_S = 1.5
-REALTIME_MAX_DATA_AGE_S = 1.5
+PASSIVE_PLOUGH_FORWARD_TOLERANCE_MPS = 1.0e-9
+PASSIVE_PLOUGH_SAMPLE_STEP_MAX_S = 0.01
+_KINEMATICS_EPSILON = 1.0e-12
+
+
+class PassivePloughDomainError(ValueError):
+    """船速超出前向被动拖曳模型适用域。"""
+
+
+@dataclass(frozen=True)
+class PassivePloughKinematicSample:
+    """被动拖曳犁在一个内部子步时刻的艏向和前进速度。"""
+
+    time_s: float
+    heading_rad: float
+    speed_mps: float
+
+
+def passive_plough_forward_speed(
+    vessel_velocity_x_mps: float,
+    vessel_velocity_y_mps: float,
+    plough_heading_rad: float,
+) -> float:
+    """返回船速在犁艏向上的投影，并拒绝反向拖曳输入。"""
+
+    projection = (
+        vessel_velocity_x_mps * math.cos(plough_heading_rad)
+        + vessel_velocity_y_mps * math.sin(plough_heading_rad)
+    )
+    if projection < -PASSIVE_PLOUGH_FORWARD_TOLERANCE_MPS:
+        raise PassivePloughDomainError(
+            "vessel velocity projected onto the plough heading must be non-negative "
+            "for the forward passive-tow model "
+            f"(projection={projection:.12g} m/s)"
+        )
+    return max(0.0, projection)
+
+
+def passive_plough_kinematic_samples(
+    *,
+    start_time_s: float,
+    end_time_s: float,
+    layback_m: float,
+    initial_heading_rad: float,
+    start_vessel_velocity_x_mps: float,
+    start_vessel_velocity_y_mps: float,
+    end_vessel_velocity_x_mps: float,
+    end_vessel_velocity_y_mps: float,
+    step_max_s: float = PASSIVE_PLOUGH_SAMPLE_STEP_MAX_S,
+) -> tuple[PassivePloughKinematicSample, ...]:
+    """按拖车方程生成固定后拖距离所需的内部犁运动子步。"""
+
+    duration_s = end_time_s - start_time_s
+    if duration_s < -_KINEMATICS_EPSILON:
+        raise ValueError("passive plough interval end time must not precede start time")
+    if layback_m < 0.0 or not math.isfinite(layback_m):
+        raise ValueError("passive plough layback must be finite and non-negative")
+    if step_max_s <= 0.0 or not math.isfinite(step_max_s):
+        raise ValueError("passive plough sample step must be finite and positive")
+
+    start_speed = passive_plough_forward_speed(
+        start_vessel_velocity_x_mps,
+        start_vessel_velocity_y_mps,
+        initial_heading_rad,
+    )
+    samples = [
+        PassivePloughKinematicSample(
+            time_s=start_time_s,
+            heading_rad=initial_heading_rad,
+            speed_mps=start_speed,
+        )
+    ]
+    if duration_s <= _KINEMATICS_EPSILON:
+        return tuple(samples)
+
+    step_count = max(1, math.ceil(duration_s / step_max_s))
+    step_s = duration_s / step_count
+    heading = initial_heading_rad
+
+    def velocity_at(fraction: float) -> tuple[float, float]:
+        return (
+            start_vessel_velocity_x_mps
+            + fraction * (end_vessel_velocity_x_mps - start_vessel_velocity_x_mps),
+            start_vessel_velocity_y_mps
+            + fraction * (end_vessel_velocity_y_mps - start_vessel_velocity_y_mps),
+        )
+
+    def heading_rate(
+        current_heading: float,
+        velocity_x_mps: float,
+        velocity_y_mps: float,
+    ) -> float:
+        if layback_m <= _KINEMATICS_EPSILON:
+            return 0.0
+        return (
+            -velocity_x_mps * math.sin(current_heading)
+            + velocity_y_mps * math.cos(current_heading)
+        ) / layback_m
+
+    for index in range(step_count):
+        fraction_0 = index / step_count
+        fraction_mid = (index + 0.5) / step_count
+        fraction_1 = (index + 1.0) / step_count
+        velocity_0 = velocity_at(fraction_0)
+        velocity_mid = velocity_at(fraction_mid)
+        velocity_1 = velocity_at(fraction_1)
+        k1 = heading_rate(heading, *velocity_0)
+        heading_mid_1 = heading + 0.5 * step_s * k1
+        passive_plough_forward_speed(*velocity_mid, heading_mid_1)
+        k2 = heading_rate(heading_mid_1, *velocity_mid)
+        heading_mid_2 = heading + 0.5 * step_s * k2
+        passive_plough_forward_speed(*velocity_mid, heading_mid_2)
+        k3 = heading_rate(heading_mid_2, *velocity_mid)
+        heading_end = heading + step_s * k3
+        passive_plough_forward_speed(*velocity_1, heading_end)
+        k4 = heading_rate(heading_end, *velocity_1)
+        heading += step_s * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+        heading = math.atan2(math.sin(heading), math.cos(heading))
+        speed = passive_plough_forward_speed(*velocity_1, heading)
+        samples.append(
+            PassivePloughKinematicSample(
+                time_s=start_time_s + (index + 1) * step_s,
+                heading_rad=heading,
+                speed_mps=speed,
+            )
+        )
+    return tuple(samples)
 
 
 def validate_realtime_current_representation(
@@ -94,8 +218,6 @@ class RealtimeSensorPacket:
 
     sequence: int
     time_s: float
-    observed_at_unix_s: float
-    quality: str
     vessel: SynchronizedEndpointSample
     plough: SynchronizedEndpointSample
     payout_speed_mps: float
@@ -108,6 +230,8 @@ class RealtimeSensorPacket:
     current_direction_unwrapped_deg: float | None = None
     plough_position_uncertainty_m: float | None = None
     measured_top_tension_n: float | None = None
+    plough_heading_rad: float | None = None
+    plough_layback_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -129,8 +253,6 @@ class RealtimeFrameResult:
     time_s: float
     compute_wall_s: float
     realtime_factor: float | None
-    input_age_s: float
-    input_status: str
     plough_exit_speed_mps: float
     plough_exit_speed_source: str
     plough_position_source: str
@@ -193,8 +315,6 @@ class RealtimeSimulationSession:
         base_case,
         initial_packet: RealtimeSensorPacket,
         max_sensor_gap_s: float = REALTIME_MAX_SENSOR_GAP_S,
-        max_data_age_s: float = REALTIME_MAX_DATA_AGE_S,
-        clock: Callable[[], float] = time.time,
         frame_buffer_size: int = 120,
     ) -> None:
         """使用必需的 sequence=0 状态数据包初始化会话。
@@ -205,15 +325,13 @@ class RealtimeSimulationSession:
 
         if not session_id:
             raise ValueError("session_id is required")
-        if max_sensor_gap_s <= 0.0 or max_data_age_s <= 0.0:
-            raise ValueError("sensor gap and data age limits must be positive")
+        if max_sensor_gap_s <= 0.0:
+            raise ValueError("sensor gap limit must be positive")
         if frame_buffer_size <= 0:
             raise ValueError("frame_buffer_size must be positive")
         self.session_id = session_id
         self.base_case = base_case
         self.max_sensor_gap_s = float(max_sensor_gap_s)
-        self.max_data_age_s = float(max_data_age_s)
-        self._clock = clock
         self._lock = threading.Lock()
         self._frames: deque[RealtimeFrameResult] = deque(maxlen=frame_buffer_size)
 
@@ -224,12 +342,10 @@ class RealtimeSimulationSession:
         self._previous_packet: RealtimeSensorPacket | None = None
         self._packet = initial_packet
         sample = sample_known_plough_runtime(self._runtime, initial_case)
-        age = max(0.0, self._clock() - initial_packet.observed_at_unix_s)
         self._latest = self._result(
             packet=initial_packet,
             sample=sample,
             compute_wall_s=0.0,
-            input_age_s=age,
             previous_time_s=None,
         )
         self._frames.append(self._latest)
@@ -268,7 +384,7 @@ class RealtimeSimulationSession:
         if not self._lock.acquire(blocking=False):
             raise RealtimeSessionError("session_busy", "the session is already advancing")
         try:
-            input_age = self._validate_next_packet(packet)
+            self._validate_next_packet(packet)
             previous_packet = self._packet
             step_case = self._case_for_packets(
                 previous_packet,
@@ -291,7 +407,6 @@ class RealtimeSimulationSession:
                     packet=packet,
                     sample=sample,
                     compute_wall_s=compute_wall,
-                    input_age_s=input_age,
                     previous_time_s=previous_packet.time_s,
                 )
             except Exception:
@@ -312,9 +427,8 @@ class RealtimeSimulationSession:
             raise RealtimeSessionError("sequence_conflict", "initial sequence must be 0")
         if not math.isclose(packet.time_s, 0.0, abs_tol=1.0e-9):
             raise RealtimeSessionError("non_monotonic_time", "initial time_s must be 0")
-        self._validate_quality_and_age(packet)
 
-    def _validate_next_packet(self, packet: RealtimeSensorPacket) -> float:
+    def _validate_next_packet(self, packet: RealtimeSensorPacket) -> None:
         self._validate_packet_values(packet)
         if packet.sequence != self._packet.sequence + 1:
             raise RealtimeSessionError("sequence_conflict", "sequence must increment by one")
@@ -325,15 +439,6 @@ class RealtimeSimulationSession:
             raise RealtimeSessionError("sensor_gap", "sensor time gap exceeds the session limit")
         if abs(time_step_s - REALTIME_PACKET_INTERVAL_S) > 1.0e-9:
             raise RealtimeSessionError("invalid_time_step", "time_s must increment by exactly 1.0 s")
-        return self._validate_quality_and_age(packet)
-
-    def _validate_quality_and_age(self, packet: RealtimeSensorPacket) -> float:
-        if packet.quality != "valid":
-            raise RealtimeSessionError("invalid_quality", "sensor packet quality must be valid")
-        age = self._clock() - packet.observed_at_unix_s
-        if abs(age) > self.max_data_age_s + 1.0e-12:
-            raise RealtimeSessionError("stale_sample", "sensor packet age exceeds the session limit")
-        return max(0.0, age)
 
     @staticmethod
     def _validate_packet_values(packet: RealtimeSensorPacket) -> None:
@@ -341,7 +446,6 @@ class RealtimeSimulationSession:
 
         numeric_values = (
             packet.time_s,
-            packet.observed_at_unix_s,
             packet.vessel.x_m,
             packet.vessel.y_m,
             packet.vessel.z_m,
@@ -364,6 +468,8 @@ class RealtimeSimulationSession:
             packet.current_direction_unwrapped_deg,
             packet.plough_position_uncertainty_m,
             packet.measured_top_tension_n,
+            packet.plough_heading_rad,
+            packet.plough_layback_m,
         )
         if packet.sequence < 0 or any(not math.isfinite(float(value)) for value in numeric_values):
             raise RealtimeSessionError("invalid_packet", "sensor packet values must be finite")
@@ -390,6 +496,8 @@ class RealtimeSimulationSession:
             raise RealtimeSessionError("invalid_packet", "material speeds must be non-negative")
         if packet.plough_position_uncertainty_m is not None and packet.plough_position_uncertainty_m < 0.0:
             raise RealtimeSessionError("invalid_packet", "plough position uncertainty must be non-negative")
+        if packet.plough_layback_m is not None and packet.plough_layback_m < 0.0:
+            raise RealtimeSessionError("invalid_packet", "plough layback must be non-negative")
         if packet.measured_top_tension_n is not None and packet.measured_top_tension_n < 0.0:
             raise RealtimeSessionError("invalid_packet", "measured top tension must be non-negative")
 
@@ -409,20 +517,11 @@ class RealtimeSimulationSession:
         from .simulation import CurrentSample, MotionSample, ScalarSample
 
         interpolation_packets = self._distinct_packets(preceding, start, end)
-        vessel_samples = tuple(
-            self._motion_sample(packet.time_s, packet.vessel)
-            for packet in interpolation_packets
-        )
-        plough_samples = tuple(
-            self._motion_sample(packet.time_s, packet.plough)
-            for packet in interpolation_packets
+        vessel_samples, plough_samples, plough_exit_samples = (
+            self._boundary_and_material_samples(interpolation_packets)
         )
         payout_samples = tuple(
             ScalarSample(packet.time_s, packet.payout_speed_mps)
-            for packet in interpolation_packets
-        )
-        plough_exit_samples = tuple(
-            ScalarSample(packet.time_s, self._effective_plough_exit_speed(packet))
             for packet in interpolation_packets
         )
         current_samples = tuple(
@@ -467,15 +566,99 @@ class RealtimeSimulationSession:
 
     @staticmethod
     def _effective_plough_exit_speed(packet: RealtimeSensorPacket) -> float:
-        """由内部显式值或船舶作业纵向速度确定 q_p。
+        """由内部显式值或犁运动速度确定 q_p。
 
-        生产 API 不接收显式 q_p，因此公开数据包始终进入船速派生分支。
+        生产 API 不接收显式 q_p，因此公开数据包由犁入口运动速度派生。
         dataclass 中的显式值只保留给求解器内部测试与程序化调用。
         """
 
         if packet.plough_exit_speed_mps is not None:
             return packet.plough_exit_speed_mps
-        return max(0.0, packet.vessel.velocity_x_mps)
+        return math.sqrt(
+            packet.plough.velocity_x_mps**2
+            + packet.plough.velocity_y_mps**2
+            + packet.plough.velocity_z_mps**2
+        )
+
+    @classmethod
+    def _boundary_and_material_samples(
+        cls,
+        packets: tuple[RealtimeSensorPacket, ...],
+    ) -> tuple[tuple[MotionSample, ...], tuple[MotionSample, ...], tuple[ScalarSample, ...]]:
+        """为估算犁区间生成与求解步长一致的被动拖曳子步。"""
+
+        if not packets:
+            return (), (), ()
+        vessel_samples = [cls._motion_sample(packets[0].time_s, packets[0].vessel)]
+        plough_samples = [cls._motion_sample(packets[0].time_s, packets[0].plough)]
+        plough_exit_samples = [
+            ScalarSample(packets[0].time_s, cls._effective_plough_exit_speed(packets[0]))
+        ]
+
+        for start, end in zip(packets, packets[1:]):
+            if (
+                start.plough_position_source == "estimated"
+                and end.plough_position_source == "estimated"
+                and start.plough_heading_rad is not None
+                and start.plough_layback_m is not None
+                and start.plough_exit_speed_mps is None
+                and end.plough_exit_speed_mps is None
+            ):
+                kinematic_samples = passive_plough_kinematic_samples(
+                    start_time_s=start.time_s,
+                    end_time_s=end.time_s,
+                    layback_m=start.plough_layback_m,
+                    initial_heading_rad=start.plough_heading_rad,
+                    start_vessel_velocity_x_mps=start.vessel.velocity_x_mps,
+                    start_vessel_velocity_y_mps=start.vessel.velocity_y_mps,
+                    end_vessel_velocity_x_mps=end.vessel.velocity_x_mps,
+                    end_vessel_velocity_y_mps=end.vessel.velocity_y_mps,
+                )
+                duration_s = end.time_s - start.time_s
+                for sample in kinematic_samples[1:]:
+                    fraction = (sample.time_s - start.time_s) / duration_s
+                    vessel = cls._interpolate_endpoint(start.vessel, end.vessel, fraction)
+                    depth_m = start.plough.z_m + fraction * (end.plough.z_m - start.plough.z_m)
+                    plough = SynchronizedEndpointSample(
+                        x_m=vessel.x_m - start.plough_layback_m * math.cos(sample.heading_rad),
+                        y_m=vessel.y_m - start.plough_layback_m * math.sin(sample.heading_rad),
+                        z_m=depth_m,
+                        velocity_x_mps=sample.speed_mps * math.cos(sample.heading_rad),
+                        velocity_y_mps=sample.speed_mps * math.sin(sample.heading_rad),
+                        velocity_z_mps=0.0,
+                    )
+                    vessel_samples.append(cls._motion_sample(sample.time_s, vessel))
+                    plough_samples.append(cls._motion_sample(sample.time_s, plough))
+                    plough_exit_samples.append(ScalarSample(sample.time_s, sample.speed_mps))
+                continue
+
+            vessel_samples.append(cls._motion_sample(end.time_s, end.vessel))
+            plough_samples.append(cls._motion_sample(end.time_s, end.plough))
+            plough_exit_samples.append(
+                ScalarSample(end.time_s, cls._effective_plough_exit_speed(end))
+            )
+
+        return tuple(vessel_samples), tuple(plough_samples), tuple(plough_exit_samples)
+
+    @staticmethod
+    def _interpolate_endpoint(
+        start: SynchronizedEndpointSample,
+        end: SynchronizedEndpointSample,
+        fraction: float,
+    ) -> SynchronizedEndpointSample:
+        """按公共时基线性插值端点位置和速度。"""
+
+        def interpolate(start_value: float, end_value: float) -> float:
+            return start_value + fraction * (end_value - start_value)
+
+        return SynchronizedEndpointSample(
+            x_m=interpolate(start.x_m, end.x_m),
+            y_m=interpolate(start.y_m, end.y_m),
+            z_m=interpolate(start.z_m, end.z_m),
+            velocity_x_mps=interpolate(start.velocity_x_mps, end.velocity_x_mps),
+            velocity_y_mps=interpolate(start.velocity_y_mps, end.velocity_y_mps),
+            velocity_z_mps=interpolate(start.velocity_z_mps, end.velocity_z_mps),
+        )
 
     @staticmethod
     def _distinct_packets(*packets: RealtimeSensorPacket | None):
@@ -512,7 +695,6 @@ class RealtimeSimulationSession:
         packet: RealtimeSensorPacket,
         sample: KnownPloughSample,
         compute_wall_s: float,
-        input_age_s: float,
         previous_time_s: float | None,
     ) -> RealtimeFrameResult:
         """封装已接收的求解器采样，不将测量值反馈到求解过程。
@@ -540,11 +722,9 @@ class RealtimeSimulationSession:
             time_s=packet.time_s,
             compute_wall_s=compute_wall_s,
             realtime_factor=realtime_factor,
-            input_age_s=input_age_s,
-            input_status="valid",
             plough_exit_speed_mps=effective_plough_exit_speed,
             plough_exit_speed_source=(
-                "explicit" if packet.plough_exit_speed_mps is not None else "vessel_longitudinal_inferred"
+                "explicit" if packet.plough_exit_speed_mps is not None else "plough_motion_inferred"
             ),
             plough_position_source=packet.plough_position_source,
             plough_position_uncertainty_m=packet.plough_position_uncertainty_m,
@@ -592,7 +772,6 @@ class RealtimeSessionRegistry:
         base_case,
         initial_packet: RealtimeSensorPacket,
         max_sensor_gap_s: float,
-        max_data_age_s: float,
     ) -> RealtimeSimulationSession:
         """仅在初始化成功后创建并登记会话。"""
 
@@ -602,7 +781,6 @@ class RealtimeSessionRegistry:
             base_case=base_case,
             initial_packet=initial_packet,
             max_sensor_gap_s=max_sensor_gap_s,
-            max_data_age_s=max_data_age_s,
         )
         with self._lock:
             self._sessions[session_id] = session

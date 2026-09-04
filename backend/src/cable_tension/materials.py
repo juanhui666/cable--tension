@@ -20,6 +20,7 @@ class CableParameters:
     tangential_drag_coefficient: float
     normal_drag_coefficient: float
     axial_stiffness_n: float = 1.0e9
+    bending_stiffness_n_m2: float = 0.0
     min_bending_radius_m: float | None = None
 
 
@@ -41,7 +42,8 @@ _MATERIALS: dict[str, CableParameters] = {
         name="POWER_500KV",
         diameter_m=0.139,
         weight_air_n_per_m=48.0 * 9.8,
-        submerged_weight_n_per_m=48.0 * 9.8 - 1025.0 * 9.8 * 3.141592653589793 * 0.139**2 / 4.0,
+        # 旧离线样例也直接保存已知水中单位重，不在运行时按缆径反推浮力。
+        submerged_weight_n_per_m=317.9703603438039,
         tangential_drag_coefficient=0.0,
         normal_drag_coefficient=1.0,
         axial_stiffness_n=2.66e8,

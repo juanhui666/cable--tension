@@ -46,6 +46,7 @@ worktrees/
 /scripts/
 /skills/
 /tests/
+/logs/
 /AGENTS.md
 /CONCEPTS.md
 /STRATEGY.md
@@ -57,7 +58,6 @@ worktrees/
 # Backend development, validation, documentation, and offline-only helpers
 /backend/AGENTS.md
 /backend/README.md
-/backend/API.md
 /backend/JSON参数说明.md
 /backend/LICENSE
 /backend/docs/
@@ -76,6 +76,7 @@ worktrees/
 /frontend/src/**/*.test.ts
 /frontend/src/**/*.test.tsx
 /frontend/src/test/
+/frontend/vitest.config.ts
 /frontend/src/SimulationParameterPanel.tsx
 /frontend/src/SimulationResultView.tsx
 /frontend/src/materialInput.ts

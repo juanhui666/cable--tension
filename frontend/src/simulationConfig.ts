@@ -55,16 +55,24 @@ export const DEFAULT_DYNAMIC_FORM: DynamicTimeHistoryForm = {
 };
 
 export const DEFAULT_REALTIME_FORM: RealtimeStaticForm = {
-  diameter_m: 0.139,
-  weight_air_n_per_m: 470.4,
+  cable_name: "Umbilical",
+  diameter_m: 0.2322,
+  mass_air_kg_per_m: 68.3,
+  submerged_weight_n_per_m: 304.5,
   tangential_drag_coefficient: 0,
   normal_drag_coefficient: 1,
-  axial_stiffness_n: 2.66e8,
-  water_depth_m: 80,
+  axial_stiffness_n: 950.5e6,
+  // Manufacturer sheet selection used by the editable workbench default.
+  bending_stiffness_n_m2: 78.0e3,
   initial_suspended_length_m: 85.057647044,
-  plough_layback_m: 20.74971026,
-  plough_depth_m: 79,
-  min_bending_radius_m: null,
+  plough_position_mode: "measured",
+  installation_lc_mbr_m: 8.3,
+  normal_operation_lc_mbr_m: 13.1,
+  storage_dc_mbr_m: 3.5,
+  installation_dc_mbr_m: 4.65,
+  maximum_working_load_n: 1535e3,
+  maximum_abnormal_operation_load_n: 2025e3,
+  dwp_breaking_load_n: 2640e3,
 };
 
 export const SPEED_CHANGE_OPTIONS: { value: SpeedChange; label: string }[] = [

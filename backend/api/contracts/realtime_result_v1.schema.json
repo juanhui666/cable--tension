@@ -8,15 +8,28 @@
     "session_id",
     "sequence",
     "time_s",
+    "cable",
     "cable_shape",
     "tensions",
+    "vessel_departure_angles",
     "minimum_bend_radius",
+    "bending",
+    "manufacturer_limits",
     "runtime"
   ],
   "properties": {
     "session_id": {"type": "string", "minLength": 1},
     "sequence": {"type": "integer", "minimum": 0},
     "time_s": {"type": "number", "minimum": 0},
+    "cable": {
+      "type": "object",
+      "description": "Session cable metadata echoed unchanged from initialization.",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "\\S"}
+      }
+    },
     "cable_shape": {
       "type": "object",
       "additionalProperties": false,
@@ -50,18 +63,61 @@
         "top_tension_residual_n": {"type": ["number", "null"]}
       }
     },
+    "vessel_departure_angles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["horizontal_deg", "vertical_deg"],
+      "properties": {
+        "horizontal_deg": {"type": "number", "minimum": -180, "maximum": 180},
+        "vertical_deg": {"type": "number", "minimum": -90, "maximum": 90}
+      }
+    },
     "minimum_bend_radius": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["minimum_m", "limit_m", "margin_m", "status"],
+      "required": ["minimum_m"],
       "properties": {
-        "minimum_m": {"type": ["number", "null"], "minimum": 0},
-        "limit_m": {"type": ["number", "null"], "exclusiveMinimum": 0},
-        "margin_m": {"type": ["number", "null"]},
-        "status": {
-          "type": "string",
-          "enum": ["not_configured", "not_available", "ok", "below_limit"]
-        }
+        "minimum_m": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "bending": {
+      "type": "object",
+      "description": "Unfiltered discrete centerline-curvature diagnostics using the session effective EI.",
+      "additionalProperties": false,
+      "required": [
+        "effective_stiffness_n_m2",
+        "maximum_curvature_per_m",
+        "minimum_curvature_radius_m",
+        "maximum_moment_n_m"
+      ],
+      "properties": {
+        "effective_stiffness_n_m2": {"type": "number", "minimum": 0},
+        "maximum_curvature_per_m": {"type": ["number", "null"], "minimum": 0},
+        "minimum_curvature_radius_m": {"type": ["number", "null"], "minimum": 0},
+        "maximum_moment_n_m": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "manufacturer_limits": {
+      "type": "object",
+      "description": "Echoed manufacturer references; no automatic pass/fail semantics.",
+      "additionalProperties": false,
+      "required": [
+        "installation_lc_mbr_m",
+        "normal_operation_lc_mbr_m",
+        "storage_dc_mbr_m",
+        "installation_dc_mbr_m",
+        "maximum_working_load_n",
+        "maximum_abnormal_operation_load_n",
+        "dwp_breaking_load_n"
+      ],
+      "properties": {
+        "installation_lc_mbr_m": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "normal_operation_lc_mbr_m": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "storage_dc_mbr_m": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "installation_dc_mbr_m": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "maximum_working_load_n": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "maximum_abnormal_operation_load_n": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "dwp_breaking_load_n": {"type": ["number", "null"], "exclusiveMinimum": 0}
       }
     },
     "runtime": {
@@ -83,7 +139,7 @@
         "index": {"type": "integer", "minimum": 0},
         "x_m": {"type": "number"},
         "y_m": {"type": "number"},
-        "z_m": {"type": "number", "minimum": 0}
+        "z_m": {"type": "number"}
       }
     }
   }

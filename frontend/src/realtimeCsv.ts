@@ -1,14 +1,16 @@
-import type { RealtimeSensorPacketDraft } from "./types";
+import type { PloughPositionMode, RealtimeSensorPacketDraft } from "./types";
 
 export const REALTIME_CSV_COLUMNS = [
-  "sequence", "time_s",
+  "sequence", "time_s", "water_depth_m",
   "vessel_x_m", "vessel_y_m", "vessel_z_m",
   "vessel_velocity_x_mps", "vessel_velocity_y_mps", "vessel_velocity_z_mps",
   "payout_speed_mps", "surface_current_velocity_x_mps", "surface_current_velocity_y_mps",
 ] as const;
 
 const OPTIONAL_COLUMNS = [
-  "plough_x_m", "plough_y_m", "plough_z_m", "measured_top_tension_n",
+  "plough_x_m", "plough_y_m", "plough_z_m",
+  "plough_horizontal_distance_m", "plough_bearing_deg",
+  "plough_inlet_height_above_seabed_m", "measured_top_tension_n",
 ] as const;
 
 export interface RealtimeCsvDataset {
@@ -43,18 +45,61 @@ export function parseRealtimeCsv(text: string, fileName = "传感器数据.csv")
   return { fileName, rows };
 }
 
+export function validateRealtimeDatasetMode(
+  dataset: RealtimeCsvDataset,
+  mode: PloughPositionMode,
+): void {
+  if (mode === "measured") {
+    const missingIndex = dataset.rows.findIndex((row) => !row.plough_position);
+    if (missingIndex >= 0) {
+      throw new Error(`实测犁位模式下，第 ${missingIndex + 2} 行必须提供犁入口三维位置。`);
+    }
+    const redundantIndex = dataset.rows.findIndex((row) => (
+      row.plough_horizontal_distance_m !== undefined || row.plough_bearing_deg !== undefined
+    ));
+    if (redundantIndex >= 0) {
+      throw new Error(`实测犁位模式下，第 ${redundantIndex + 2} 行不得提供 L 或水平角。`);
+    }
+    return;
+  }
+  const measuredIndex = dataset.rows.findIndex((row) => row.plough_position);
+  if (measuredIndex >= 0) {
+    throw new Error(`逐帧重建模式下，第 ${measuredIndex + 2} 行不得提供犁入口三维位置。`);
+  }
+  const missingBoundaryIndex = dataset.rows.findIndex((row) => (
+    row.plough_horizontal_distance_m === undefined
+    || row.plough_bearing_deg === undefined
+    || row.plough_inlet_height_above_seabed_m === undefined
+  ));
+  if (missingBoundaryIndex >= 0) {
+    throw new Error(`逐帧重建模式下，第 ${missingBoundaryIndex + 2} 行必须提供 L、水平角和 h。`);
+  }
+}
+
 function recordToPacket(record: Record<string, string>, line: number): RealtimeSensorPacketDraft {
   const number = (name: string, minimum?: number) => numeric(record, name, line, minimum, false) as number;
   const optional = (name: string, minimum?: number) => numeric(record, name, line, minimum, true);
+  const waterDepthM = number("water_depth_m", 0);
+  if (waterDepthM <= 0) throw new Error(`第 ${line} 行 water_depth_m 必须大于 0。`);
   const ploughValues = OPTIONAL_COLUMNS.slice(0, 3).map((name) => optional(name));
   const providedPloughValues = ploughValues.filter((value) => value !== undefined);
   if (providedPloughValues.length !== 0 && providedPloughValues.length !== 3) {
     throw new Error(`第 ${line} 行犁位必须同时提供 plough_x_m、plough_y_m、plough_z_m。`);
   }
+  if (providedPloughValues.length === 3 && (ploughValues[2] as number) > waterDepthM) {
+    throw new Error(`第 ${line} 行 plough_z_m 不得大于 water_depth_m。`);
+  }
+  const horizontalDistance = optional("plough_horizontal_distance_m", 0);
+  const bearingDeg = optional("plough_bearing_deg");
+  const inletHeight = optional("plough_inlet_height_above_seabed_m", 0);
+  if (inletHeight !== undefined && inletHeight > waterDepthM) {
+    throw new Error(`第 ${line} 行 plough_inlet_height_above_seabed_m 不得大于 water_depth_m。`);
+  }
   const measured = optional("measured_top_tension_n", 0);
   return {
     sequence: number("sequence", 0),
     time_s: number("time_s", 0),
+    water_depth_m: waterDepthM,
     vessel: {
       x_m: number("vessel_x_m"),
       y_m: number("vessel_y_m"),
@@ -75,6 +120,9 @@ function recordToPacket(record: Record<string, string>, line: number): RealtimeS
         z_m: number("plough_z_m", 0),
       },
     } : {}),
+    ...(horizontalDistance === undefined ? {} : { plough_horizontal_distance_m: horizontalDistance }),
+    ...(bearingDeg === undefined ? {} : { plough_bearing_deg: bearingDeg }),
+    ...(inletHeight === undefined ? {} : { plough_inlet_height_above_seabed_m: inletHeight }),
     ...(measured === undefined ? {} : { measured_top_tension_n: measured }),
   };
 }

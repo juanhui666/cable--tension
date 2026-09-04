@@ -37,15 +37,21 @@ def error_response(
     return json_response(payload, status=status)
 
 
-def realtime_result_payload(result: Any) -> dict[str, Any]:
+def realtime_result_payload(
+    result: Any,
+    *,
+    cable_name: str,
+    manufacturer_limits: dict[str, float | None] | None = None,
+) -> dict[str, Any]:
     """初始化和每秒更新均返回同一结果结构。"""
 
     point = result.point
-    bend = result.bend_radius_constraint
+    references = manufacturer_limits or {}
     return {
         "session_id": result.session_id,
         "sequence": int(result.sequence),
         "time_s": float(result.time_s),
+        "cable": {"name": cable_name},
         "cable_shape": {
             "points": [
                 {
@@ -74,11 +80,34 @@ def realtime_result_payload(result: Any) -> dict[str, Any]:
                 else float(result.top_tension_residual_n)
             ),
         },
+        "vessel_departure_angles": {
+            "horizontal_deg": float(result.vessel_departure_horizontal_angle_deg),
+            "vertical_deg": float(result.vessel_departure_vertical_angle_deg),
+        },
         "minimum_bend_radius": {
-            "minimum_m": bend.minimum_m,
-            "limit_m": bend.limit_m,
-            "margin_m": bend.margin_m,
-            "status": bend.status,
+            "minimum_m": result.minimum_bend_radius_m,
+        },
+        "bending": {
+            "effective_stiffness_n_m2": float(
+                result.effective_bending_stiffness_n_m2
+            ),
+            "maximum_curvature_per_m": result.maximum_curvature_per_m,
+            "minimum_curvature_radius_m": result.minimum_bend_radius_m,
+            "maximum_moment_n_m": result.maximum_bending_moment_n_m,
+        },
+        "manufacturer_limits": {
+            field: (
+                None if references.get(field) is None else float(references[field])
+            )
+            for field in (
+                "installation_lc_mbr_m",
+                "normal_operation_lc_mbr_m",
+                "storage_dc_mbr_m",
+                "installation_dc_mbr_m",
+                "maximum_working_load_n",
+                "maximum_abnormal_operation_load_n",
+                "dwp_breaking_load_n",
+            )
         },
         "runtime": {
             "compute_wall_s": float(result.compute_wall_s),

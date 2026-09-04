@@ -7,6 +7,7 @@
   "required": [
     "sequence",
     "time_s",
+    "water_depth_m",
     "vessel",
     "payout_speed_mps",
     "surface_current"
@@ -14,10 +15,14 @@
   "properties": {
     "sequence": {"type": "integer", "minimum": 0},
     "time_s": {"type": "number", "minimum": 0},
+    "water_depth_m": {"type": "number", "exclusiveMinimum": 0},
     "vessel": {"$ref": "#/$defs/vesselMotion"},
     "payout_speed_mps": {"type": "number", "minimum": 0},
     "surface_current": {"$ref": "#/$defs/horizontalVelocity"},
     "plough_position": {"$ref": "#/$defs/position"},
+    "plough_horizontal_distance_m": {"type": "number", "minimum": 0},
+    "plough_bearing_deg": {"type": "number"},
+    "plough_inlet_height_above_seabed_m": {"type": "number", "minimum": 0},
     "measured_top_tension_n": {"type": "number", "minimum": 0}
   },
   "$defs": {

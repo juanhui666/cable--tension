@@ -26,7 +26,6 @@ from .dynamic_laying import (
     KnownPloughSample,
     advance_known_plough_runtime,
     initialize_known_plough_runtime,
-    minimum_bend_radius_status,
     sample_known_plough_runtime,
 )
 
@@ -37,6 +36,77 @@ REALTIME_MAX_SENSOR_GAP_S = 1.5
 PASSIVE_PLOUGH_FORWARD_TOLERANCE_MPS = 1.0e-9
 PASSIVE_PLOUGH_SAMPLE_STEP_MAX_S = 0.01
 _KINEMATICS_EPSILON = 1.0e-12
+
+
+def strict_realtime_bending_diagnostic(
+    frame: object,
+    *,
+    bending_stiffness_n_m2: float,
+    rest_lengths_m: tuple[float, ...] | None = None,
+) -> tuple[float | None, float | None, float | None]:
+    """Return the unfiltered discrete minimum radius over every interior node.
+
+    The public realtime path deliberately applies no short-segment, seabed or
+    tail-node exclusions. An exact degenerate adjacent segment makes the
+    diagnostic unavailable. Curvature is ``turn/mean_adjacent_reference_length
+    [1/m]`` when material lengths are supplied, matching the discrete bending
+    energy; the reported moment magnitude is ``EI*kappa [N*m]``.
+    """
+
+    points = frame.points
+    if len(points) < 3:
+        return None, None, None
+    if rest_lengths_m is not None and len(rest_lengths_m) != len(points) - 1:
+        raise ValueError("rest_lengths_m must contain one entry per cable segment")
+    maximum_curvature = 0.0
+    for node_index, (previous, current, next_point) in enumerate(
+        zip(points, points[1:], points[2:]),
+        start=1,
+    ):
+        first = (
+            float(current.x_m - previous.x_m),
+            float(current.y_m - previous.y_m),
+            float(current.z_m - previous.z_m),
+        )
+        second = (
+            float(next_point.x_m - current.x_m),
+            float(next_point.y_m - current.y_m),
+            float(next_point.z_m - current.z_m),
+        )
+        first_length = math.sqrt(sum(component * component for component in first))
+        second_length = math.sqrt(sum(component * component for component in second))
+        if first_length <= _KINEMATICS_EPSILON or second_length <= _KINEMATICS_EPSILON:
+            return None, None, None
+        cosine = sum(a * b for a, b in zip(first, second)) / (first_length * second_length)
+        turn = math.acos(max(-1.0, min(1.0, cosine)))
+        mean_length = (
+            0.5 * (first_length + second_length)
+            if rest_lengths_m is None
+            else 0.5 * (
+                rest_lengths_m[node_index - 1] + rest_lengths_m[node_index]
+            )
+        )
+        if mean_length <= _KINEMATICS_EPSILON:
+            return None, None, None
+        curvature = turn / mean_length
+        maximum_curvature = max(maximum_curvature, curvature)
+    minimum_radius = (
+        None
+        if maximum_curvature <= _KINEMATICS_EPSILON
+        else 1.0 / maximum_curvature
+    )
+    maximum_moment = bending_stiffness_n_m2 * maximum_curvature
+    return minimum_radius, maximum_curvature, maximum_moment
+
+
+def strict_realtime_minimum_bend_radius_m(frame: object) -> float | None:
+    """Backward-compatible radius-only wrapper for existing callers."""
+
+    minimum_radius, _, _ = strict_realtime_bending_diagnostic(
+        frame,
+        bending_stiffness_n_m2=0.0,
+    )
+    return minimum_radius
 
 
 class PassivePloughDomainError(ValueError):
@@ -218,6 +288,7 @@ class RealtimeSensorPacket:
 
     sequence: int
     time_s: float
+    water_depth_m: float
     vessel: SynchronizedEndpointSample
     plough: SynchronizedEndpointSample
     payout_speed_mps: float
@@ -235,16 +306,6 @@ class RealtimeSensorPacket:
 
 
 @dataclass(frozen=True)
-class RealtimeBendRadiusConstraint:
-    """一个实时帧对应的最小弯曲半径约束状态。"""
-
-    minimum_m: float | None
-    limit_m: float | None
-    margin_m: float | None
-    status: str
-
-
-@dataclass(frozen=True)
 class RealtimeFrameResult:
     """实时会话返回的最新帧及计时依据。"""
 
@@ -259,42 +320,17 @@ class RealtimeFrameResult:
     plough_position_uncertainty_m: float | None
     measured_top_tension_n: float | None
     top_tension_residual_n: float | None
-    plough_inlet_horizontal_angle_deg: float
-    plough_inlet_vertical_angle_deg: float
+    vessel_departure_horizontal_angle_deg: float
+    vessel_departure_vertical_angle_deg: float
+    minimum_bend_radius_m: float | None
+    maximum_curvature_per_m: float | None
+    maximum_bending_moment_n_m: float | None
+    effective_bending_stiffness_n_m2: float
     point: TimeHistoryPoint
     frame: TimeHistoryFrame
     integration_time_step_min_s: float | None
     integration_time_step_max_s: float | None
     axial_constraint_residual_max_m: float | None
-    bend_radius_constraint: RealtimeBendRadiusConstraint
-
-
-def realtime_bend_radius_constraint(
-    minimum_m: float | None,
-    limit_m: float | None,
-) -> RealtimeBendRadiusConstraint:
-    """按离线汇总相同口径形成当前实时帧的弯曲约束状态。"""
-
-    finite_minimum = (
-        None
-        if minimum_m is None or not math.isfinite(minimum_m)
-        else float(minimum_m)
-    )
-    finite_limit = None if limit_m is None else float(limit_m)
-    margin_m = (
-        None
-        if finite_minimum is None or finite_limit is None
-        else finite_minimum - finite_limit
-    )
-    return RealtimeBendRadiusConstraint(
-        minimum_m=finite_minimum,
-        limit_m=finite_limit,
-        margin_m=margin_m,
-        status=minimum_bend_radius_status(
-            minimum_radius_m=finite_minimum,
-            limit_m=finite_limit,
-        ),
-    )
 
 
 class RealtimeSessionError(ValueError):
@@ -446,6 +482,7 @@ class RealtimeSimulationSession:
 
         numeric_values = (
             packet.time_s,
+            packet.water_depth_m,
             packet.vessel.x_m,
             packet.vessel.y_m,
             packet.vessel.z_m,
@@ -475,10 +512,10 @@ class RealtimeSimulationSession:
             raise RealtimeSessionError("invalid_packet", "sensor packet values must be finite")
         if any(value is not None and not math.isfinite(float(value)) for value in optional_numeric_values):
             raise RealtimeSessionError("invalid_packet", "optional sensor packet values must be finite")
-        if packet.plough_position_source not in {"estimated", "measured"}:
+        if packet.plough_position_source not in {"estimated", "measured", "reconstructed"}:
             raise RealtimeSessionError(
                 "invalid_packet",
-                "plough position source must be estimated or measured",
+                "plough position source must be estimated, measured or reconstructed",
             )
         try:
             validate_realtime_current_representation(
@@ -494,6 +531,13 @@ class RealtimeSimulationSession:
             packet.plough_exit_speed_mps is not None and packet.plough_exit_speed_mps < 0.0
         ):
             raise RealtimeSessionError("invalid_packet", "material speeds must be non-negative")
+        if packet.water_depth_m <= 0.0:
+            raise RealtimeSessionError("invalid_packet", "water depth must be positive")
+        if not 0.0 <= packet.plough.z_m <= packet.water_depth_m:
+            raise RealtimeSessionError(
+                "invalid_packet",
+                "plough depth must be between 0 and water depth",
+            )
         if packet.plough_position_uncertainty_m is not None and packet.plough_position_uncertainty_m < 0.0:
             raise RealtimeSessionError("invalid_packet", "plough position uncertainty must be non-negative")
         if packet.plough_layback_m is not None and packet.plough_layback_m < 0.0:
@@ -549,6 +593,7 @@ class RealtimeSimulationSession:
         )
         return replace(
             self.base_case,
+            water_depth_m=end.water_depth_m,
             current_speed_mps=current_speed,
             current_direction_deg=current_direction,
             payout_initial_speed_mps=start.payout_speed_mps,
@@ -615,6 +660,7 @@ class RealtimeSimulationSession:
                     end_vessel_velocity_y_mps=end.vessel.velocity_y_mps,
                 )
                 duration_s = end.time_s - start.time_s
+                plough_vertical_speed_mps = (end.plough.z_m - start.plough.z_m) / duration_s
                 for sample in kinematic_samples[1:]:
                     fraction = (sample.time_s - start.time_s) / duration_s
                     vessel = cls._interpolate_endpoint(start.vessel, end.vessel, fraction)
@@ -625,7 +671,7 @@ class RealtimeSimulationSession:
                         z_m=depth_m,
                         velocity_x_mps=sample.speed_mps * math.cos(sample.heading_rad),
                         velocity_y_mps=sample.speed_mps * math.sin(sample.heading_rad),
-                        velocity_z_mps=0.0,
+                        velocity_z_mps=plough_vertical_speed_mps,
                     )
                     vessel_samples.append(cls._motion_sample(sample.time_s, vessel))
                     plough_samples.append(cls._motion_sample(sample.time_s, plough))
@@ -711,10 +757,16 @@ class RealtimeSimulationSession:
         effective_plough_exit_speed = self._effective_plough_exit_speed(packet)
         top_tension = float(sample.point.top_tension_n)
         measured_top_tension = packet.measured_top_tension_n
-        horizontal_angle, vertical_angle = self._plough_inlet_angles(sample.frame)
-        bend_radius_constraint = realtime_bend_radius_constraint(
-            sample.frame.minimum_bend_radius_m,
-            self.base_case.min_bending_radius_m,
+        horizontal_angle, vertical_angle = self._vessel_departure_angles(sample.frame)
+        bending_stiffness = float(self.base_case.bending_stiffness_n_m2)
+        (
+            minimum_bend_radius,
+            maximum_curvature,
+            maximum_bending_moment,
+        ) = strict_realtime_bending_diagnostic(
+            sample.frame,
+            bending_stiffness_n_m2=bending_stiffness,
+            rest_lengths_m=self._runtime.state.rest_lengths_m,
         )
         return RealtimeFrameResult(
             session_id=self.session_id,
@@ -732,28 +784,31 @@ class RealtimeSimulationSession:
             top_tension_residual_n=(
                 None if measured_top_tension is None else measured_top_tension - top_tension
             ),
-            plough_inlet_horizontal_angle_deg=horizontal_angle,
-            plough_inlet_vertical_angle_deg=vertical_angle,
+            vessel_departure_horizontal_angle_deg=horizontal_angle,
+            vessel_departure_vertical_angle_deg=vertical_angle,
+            minimum_bend_radius_m=minimum_bend_radius,
+            maximum_curvature_per_m=maximum_curvature,
+            maximum_bending_moment_n_m=maximum_bending_moment,
+            effective_bending_stiffness_n_m2=bending_stiffness,
             point=sample.point,
             frame=sample.frame,
             integration_time_step_min_s=self._runtime.integration_time_step_min_s,
             integration_time_step_max_s=self._runtime.integration_time_step_max_s,
             axial_constraint_residual_max_m=self._runtime.axial_constraint_residual_max_m,
-            bend_radius_constraint=bend_radius_constraint,
         )
 
     @staticmethod
-    def _plough_inlet_angles(frame: object) -> tuple[float, float]:
+    def _vessel_departure_angles(frame: object) -> tuple[float, float]:
         points = frame.points
         if len(points) < 2:
-            raise RuntimeError("plough inlet direction requires at least two cable nodes")
-        previous, inlet = points[-2], points[-1]
-        dx = float(inlet.x_m - previous.x_m)
-        dy = float(inlet.y_m - previous.y_m)
-        dz = float(inlet.z_m - previous.z_m)
+            raise RuntimeError("vessel departure direction requires at least two cable nodes")
+        fairlead, next_point = points[0], points[1]
+        dx = float(next_point.x_m - fairlead.x_m)
+        dy = float(next_point.y_m - fairlead.y_m)
+        dz = float(next_point.z_m - fairlead.z_m)
         length = math.sqrt(dx * dx + dy * dy + dz * dz)
         if length <= 1.0e-12:
-            raise RuntimeError("plough inlet direction is undefined for a zero-length final segment")
+            raise RuntimeError("vessel departure direction is undefined for a zero-length first segment")
         horizontal_angle = math.degrees(math.atan2(dy, dx))
         vertical_angle = math.degrees(math.atan2(dz, math.hypot(dx, dy)))
         return horizontal_angle, vertical_angle

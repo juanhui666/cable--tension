@@ -45,7 +45,6 @@ except ImportError:  # pragma: no cover
 
 
 _GRAVITY_MPS2 = 9.8
-_SEAWATER_DENSITY_KG_M3 = 1025.0
 _REALTIME_ELEMENT_COUNT = 48
 _REALTIME_INTEGRATION_TIME_STEP_MAX_S = 0.01
 _REALTIME_CURRENT_BOTTOM_SPEED_MPS = 0.0
@@ -57,17 +56,17 @@ _SPEED_EPSILON_MPS = 1.0e-12
 class _RealtimeSetup:
     """由公开初始化输入得到的规范静态量。"""
 
+    cable_name: str
     diameter_m: float
     weight_air_n_per_m: float
     submerged_weight_n_per_m: float
     tangential_drag_coefficient: float
     normal_drag_coefficient: float
     axial_stiffness_n: float
-    min_bending_radius_m: float | None
-    water_depth_m: float
+    bending_stiffness_n_m2: float
     initial_suspended_length_m: float
-    plough_layback_m: float
-    plough_depth_m: float
+    plough_position_mode: str
+    manufacturer_limits: dict[str, float | None]
 
 
 @dataclass(frozen=True)
@@ -85,6 +84,7 @@ class _PloughBoundaryState:
     vessel_velocity_x_mps: float
     vessel_velocity_y_mps: float
     time_s: float
+    position_mode: str
 
 
 class CableApiServer:
@@ -93,6 +93,8 @@ class CableApiServer:
     def __init__(self) -> None:
         self.realtime_sessions = RealtimeSessionRegistry()
         self._plough_states: dict[str, _PloughBoundaryState] = {}
+        self._cable_names: dict[str, str] = {}
+        self._manufacturer_limits: dict[str, dict[str, float | None]] = {}
 
     def handle(
         self,
@@ -159,17 +161,13 @@ class CableApiServer:
             return setup
         initial_packet = _parse_public_packet(
             payload.get("initial_packet"),
-            default_plough_boundary=(
-                -setup.plough_layback_m,
-                0.0,
-                setup.plough_depth_m,
-            ),
             previous_plough_state=None,
+            plough_position_mode=setup.plough_position_mode,
         )
         if isinstance(initial_packet, ApiResponse):
             return initial_packet
         packet, plough_state = initial_packet
-        if packet.plough.z_m < 0.0 or packet.plough.z_m > setup.water_depth_m:
+        if packet.plough.z_m < 0.0 or packet.plough.z_m > packet.water_depth_m:
             return _invalid_input(
                 "Realtime initialization contains an invalid plough depth.",
                 {"initial_packet.plough_position.z_m": "must be between 0 and water depth"},
@@ -205,7 +203,16 @@ class CableApiServer:
                 details={"reason": str(exc)},
             )
         self._plough_states[session.session_id] = plough_state
-        return json_response(realtime_result_payload(session.latest), status=201)
+        self._cable_names[session.session_id] = setup.cable_name
+        self._manufacturer_limits[session.session_id] = setup.manufacturer_limits
+        return json_response(
+            realtime_result_payload(
+                session.latest,
+                cable_name=setup.cable_name,
+                manufacturer_limits=setup.manufacturer_limits,
+            ),
+            status=201,
+        )
 
     def _advance_realtime_session(
         self,
@@ -222,17 +229,13 @@ class CableApiServer:
             return _invalid_input("Realtime update does not match the public schema.", structure_errors)
         parsed = _parse_public_packet(
             payload,
-            default_plough_boundary=(
-                self._plough_states[session_id].horizontal_offset_x_m,
-                self._plough_states[session_id].horizontal_offset_y_m,
-                self._plough_states[session_id].depth_m,
-            ),
             previous_plough_state=self._plough_states[session_id],
+            plough_position_mode=self._plough_states[session_id].position_mode,
         )
         if isinstance(parsed, ApiResponse):
             return parsed
         packet, candidate_plough_state = parsed
-        if packet.plough.z_m < 0.0 or packet.plough.z_m > session.base_case.water_depth_m:
+        if packet.plough.z_m < 0.0 or packet.plough.z_m > packet.water_depth_m:
             return _invalid_input(
                 "Realtime update contains an invalid plough depth.",
                 {"plough_position.z_m": "must be between 0 and water depth"},
@@ -264,81 +267,106 @@ class CableApiServer:
             )
         # 只有求解状态提交后才接受位置、时刻和后拖边界。
         self._plough_states[session_id] = candidate_plough_state
-        return json_response(realtime_result_payload(result))
+        return json_response(
+            realtime_result_payload(
+                result,
+                cable_name=self._cable_names[session_id],
+                manufacturer_limits=self._manufacturer_limits[session_id],
+            )
+        )
 
 
 def _parse_realtime_setup(payload: dict[str, Any]) -> _RealtimeSetup | ApiResponse:
     cable = payload.get("cable")
-    environment = payload.get("environment")
     geometry = payload.get("initial_geometry")
-    if not isinstance(cable, dict) or not isinstance(environment, dict) or not isinstance(geometry, dict):
+    if not isinstance(cable, dict) or not isinstance(geometry, dict):
         return _invalid_input("Realtime initialization groups are invalid.", {"$": "invalid object groups"})
 
     errors: dict[str, str] = {}
+    cable_name = cable.get("name")
+    if not isinstance(cable_name, str) or not cable_name.strip():
+        errors["cable.name"] = "must be a non-empty string"
+    elif len(cable_name) > 128:
+        errors["cable.name"] = "must contain at most 128 characters"
     diameter = _positive(cable, "diameter_m", "cable", errors)
     mass_air = _positive(cable, "mass_air_kg_per_m", "cable", errors)
+    submerged_weight = _positive(
+        cable,
+        "submerged_weight_n_per_m",
+        "cable",
+        errors,
+    )
     axial_stiffness = _positive(cable, "axial_stiffness_n", "cable", errors)
+    bending_stiffness = _optional_nonnegative(
+        cable,
+        "bending_stiffness_n_m2",
+        "cable",
+        errors,
+    )
     tangential_drag = _nonnegative(cable, "tangential_drag_coefficient", "cable", errors)
     normal_drag = _nonnegative(cable, "normal_drag_coefficient", "cable", errors)
-    minimum_bend = _optional_positive(cable, "min_bending_radius_m", "cable", errors)
-    water_depth = _positive(environment, "water_depth_m", "environment", errors)
     suspended_length = _positive(geometry, "initial_suspended_length_m", "initial_geometry", errors)
-    layback = _nonnegative(geometry, "plough_layback_m", "initial_geometry", errors)
-    plough_depth = _positive(geometry, "plough_depth_m", "initial_geometry", errors)
-    if water_depth is not None and plough_depth is not None and plough_depth > water_depth:
-        errors["initial_geometry.plough_depth_m"] = "must not exceed environment.water_depth_m"
-
-    if diameter is not None and mass_air is not None:
-        weight_air = mass_air * _GRAVITY_MPS2
-        buoyancy = (
-            _SEAWATER_DENSITY_KG_M3
-            * _GRAVITY_MPS2
-            * math.pi
-            * diameter**2
-            / 4.0
+    plough_position_mode = geometry.get("plough_position_mode")
+    if plough_position_mode not in {"measured", "reconstructed"}:
+        errors["initial_geometry.plough_position_mode"] = (
+            "must be 'measured' or 'reconstructed'"
         )
-        submerged_weight = weight_air - buoyancy
-        if submerged_weight <= 0.0:
-            errors["cable.mass_air_kg_per_m"] = (
-                "must produce a positive submerged unit weight with the supplied diameter"
-            )
-    else:
-        weight_air = 0.0
-        submerged_weight = 0.0
+
+    manufacturer_payload = payload.get("manufacturer_limits") or {}
+    manufacturer_limits = {
+        field: _optional_positive(
+            manufacturer_payload,
+            field,
+            "manufacturer_limits",
+            errors,
+        )
+        for field in (
+            "installation_lc_mbr_m",
+            "normal_operation_lc_mbr_m",
+            "storage_dc_mbr_m",
+            "installation_dc_mbr_m",
+            "maximum_working_load_n",
+            "maximum_abnormal_operation_load_n",
+            "dwp_breaking_load_n",
+        )
+    }
+    weight_air = 0.0 if mass_air is None else mass_air * _GRAVITY_MPS2
     if errors:
         return _invalid_input("Realtime initialization values are invalid.", errors)
 
     assert None not in (
         diameter,
         mass_air,
+        submerged_weight,
         axial_stiffness,
         tangential_drag,
         normal_drag,
-        water_depth,
         suspended_length,
-        layback,
-        plough_depth,
     )
+    assert isinstance(plough_position_mode, str)
+    assert isinstance(cable_name, str)
     return _RealtimeSetup(
+        cable_name=cable_name,
         diameter_m=diameter,
         weight_air_n_per_m=weight_air,
         submerged_weight_n_per_m=submerged_weight,
         tangential_drag_coefficient=tangential_drag,
         normal_drag_coefficient=normal_drag,
         axial_stiffness_n=axial_stiffness,
-        min_bending_radius_m=minimum_bend,
-        water_depth_m=water_depth,
+        bending_stiffness_n_m2=(
+            0.0 if bending_stiffness is None else bending_stiffness
+        ),
         initial_suspended_length_m=suspended_length,
-        plough_layback_m=layback,
-        plough_depth_m=plough_depth,
+        plough_position_mode=plough_position_mode,
+        manufacturer_limits=manufacturer_limits,
     )
 
 
 def _parse_public_packet(
     value: Any,
     *,
-    default_plough_boundary: tuple[float, float, float],
     previous_plough_state: _PloughBoundaryState | None = None,
+    plough_position_mode: str,
 ) -> tuple[RealtimeSensorPacket, _PloughBoundaryState] | ApiResponse:
     """将平台工程量适配为求解器内部同步包。"""
 
@@ -351,6 +379,9 @@ def _parse_public_packet(
     time_s = _number(value.get("time_s"))
     if time_s is None or time_s < 0.0:
         errors["time_s"] = "must be greater than or equal to 0"
+    water_depth = _number(value.get("water_depth_m"))
+    if water_depth is None or water_depth <= 0.0:
+        errors["water_depth_m"] = "must be greater than 0"
     payout_speed = _number(value.get("payout_speed_mps"))
     if payout_speed is None or payout_speed < 0.0:
         errors["payout_speed_mps"] = "must be greater than or equal to 0"
@@ -368,43 +399,79 @@ def _parse_public_packet(
         if position_value is None
         else _parse_position(position_value, "plough_position", errors)
     )
+    horizontal_distance = _optional_number(value.get("plough_horizontal_distance_m"))
+    if value.get("plough_horizontal_distance_m") is not None and (
+        horizontal_distance is None or horizontal_distance < 0.0
+    ):
+        errors["plough_horizontal_distance_m"] = "must be greater than or equal to 0"
+    bearing_deg = _optional_number(value.get("plough_bearing_deg"))
+    if value.get("plough_bearing_deg") is not None and bearing_deg is None:
+        errors["plough_bearing_deg"] = "must be a finite number"
+    inlet_height_above_seabed = _optional_number(
+        value.get("plough_inlet_height_above_seabed_m")
+    )
+    if value.get("plough_inlet_height_above_seabed_m") is not None and (
+        inlet_height_above_seabed is None or inlet_height_above_seabed < 0.0
+    ):
+        errors["plough_inlet_height_above_seabed_m"] = "must be greater than or equal to 0"
+    if (
+        inlet_height_above_seabed is not None
+        and water_depth is not None
+        and inlet_height_above_seabed > water_depth
+    ):
+        errors["plough_inlet_height_above_seabed_m"] = "must not exceed water_depth_m"
+
+    if plough_position_mode == "measured" and measured_position is None:
+        errors["plough_position"] = "is required in every packet in measured mode"
+    if plough_position_mode == "measured":
+        if horizontal_distance is not None:
+            errors["plough_horizontal_distance_m"] = "is not used in measured mode"
+        if bearing_deg is not None:
+            errors["plough_bearing_deg"] = "is not used in measured mode"
+    if plough_position_mode == "reconstructed":
+        if measured_position is not None:
+            errors["plough_position"] = "is not accepted in reconstructed mode"
+        if horizontal_distance is None:
+            errors["plough_horizontal_distance_m"] = "is required in reconstructed mode"
+        if bearing_deg is None:
+            errors["plough_bearing_deg"] = "is required in reconstructed mode"
+        if inlet_height_above_seabed is None:
+            errors["plough_inlet_height_above_seabed_m"] = "is required in reconstructed mode"
     if errors:
         return _invalid_input("Realtime packet values are invalid.", errors)
-    assert sequence is not None and time_s is not None and payout_speed is not None
+    assert sequence is not None and time_s is not None and water_depth is not None and payout_speed is not None
     assert vessel is not None and current_x is not None and current_y is not None
 
     try:
         if measured_position is None:
-            offset_x, offset_y, depth = default_plough_boundary
-            if previous_plough_state is None:
-                layback = math.hypot(offset_x, offset_y)
-                heading = _initial_plough_heading(
-                    offset_x,
-                    offset_y,
-                    vessel.velocity_x_mps,
-                    vessel.velocity_y_mps,
-                )
-            else:
-                layback = previous_plough_state.horizontal_layback_m
-                heading = _advance_passive_plough_heading(
-                    previous_plough_state,
-                    vessel.velocity_x_mps,
-                    vessel.velocity_y_mps,
-                    time_s,
-                )
-            offset_x = -layback * math.cos(heading)
-            offset_y = -layback * math.sin(heading)
+            assert horizontal_distance is not None
+            assert bearing_deg is not None
+            assert inlet_height_above_seabed is not None
+            layback = horizontal_distance
+            depth = water_depth - inlet_height_above_seabed
+            bearing_rad = math.radians(bearing_deg)
+            offset_x = layback * math.cos(bearing_rad)
+            offset_y = layback * math.sin(bearing_rad)
             position_x = vessel.x_m + offset_x
             position_y = vessel.y_m + offset_y
             position_z = depth
-            plough_speed = _passive_plough_speed(
-                vessel.velocity_x_mps,
-                vessel.velocity_y_mps,
-                heading,
-            )
-            velocity_x = plough_speed * math.cos(heading)
-            velocity_y = plough_speed * math.sin(heading)
-            velocity_z = 0.0
+            if previous_plough_state is None or time_s <= previous_plough_state.time_s:
+                velocity_x = vessel.velocity_x_mps
+                velocity_y = vessel.velocity_y_mps
+                velocity_z = 0.0
+                heading = math.atan2(velocity_y, velocity_x) if math.hypot(
+                    velocity_x,
+                    velocity_y,
+                ) > _SPEED_EPSILON_MPS else (bearing_rad + math.pi)
+            else:
+                time_step_s = time_s - previous_plough_state.time_s
+                velocity_x = (position_x - previous_plough_state.position_x_m) / time_step_s
+                velocity_y = (position_y - previous_plough_state.position_y_m) / time_step_s
+                velocity_z = (position_z - previous_plough_state.position_z_m) / time_step_s
+                heading = math.atan2(velocity_y, velocity_x) if math.hypot(
+                    velocity_x,
+                    velocity_y,
+                ) > _SPEED_EPSILON_MPS else (bearing_rad + math.pi)
         else:
             position_x, position_y, position_z = measured_position
             offset_x = position_x - vessel.x_m
@@ -466,15 +533,19 @@ def _parse_public_packet(
         vessel_velocity_x_mps=vessel.velocity_x_mps,
         vessel_velocity_y_mps=vessel.velocity_y_mps,
         time_s=time_s,
+        position_mode=plough_position_mode,
     )
     return (
         RealtimeSensorPacket(
             sequence=sequence,
             time_s=time_s,
+            water_depth_m=water_depth,
             vessel=vessel,
             plough=plough,
             payout_speed_mps=payout_speed,
-            plough_position_source="measured" if measured_position is not None else "estimated",
+            plough_position_source=(
+                "measured" if measured_position is not None else "reconstructed"
+            ),
             plough_exit_speed_mps=None,
             current_velocity_x_mps=current_x,
             current_velocity_y_mps=current_y,
@@ -527,6 +598,7 @@ def _realtime_case_from_setup(
         tangential_drag_coefficient=setup.tangential_drag_coefficient,
         normal_drag_coefficient=setup.normal_drag_coefficient,
         axial_stiffness_n=setup.axial_stiffness_n,
+        bending_stiffness_n_m2=setup.bending_stiffness_n_m2,
         current_speed_mps=current_speed,
         current_bottom_speed_mps=_REALTIME_CURRENT_BOTTOM_SPEED_MPS,
         current_profile_exponent=_REALTIME_CURRENT_PROFILE_EXPONENT,
@@ -541,7 +613,7 @@ def _realtime_case_from_setup(
         payout_final_speed_mps=initial_packet.payout_speed_mps,
         transition_duration_s=1.0,
         total_duration_s=1.0,
-        water_depth_m=setup.water_depth_m,
+        water_depth_m=initial_packet.water_depth_m,
         element_count=_REALTIME_ELEMENT_COUNT,
         length_boundary_source="known_plough_trajectory",
         vessel_initial_x_m=initial_packet.vessel.x_m,
@@ -554,7 +626,8 @@ def _realtime_case_from_setup(
         plough_exit_speed_mps=None,
         plough_heading_deg=plough_heading,
         initial_suspended_length_m=setup.initial_suspended_length_m,
-        min_bending_radius_m=setup.min_bending_radius_m,
+        # 厂家 MBR 仅作为外部参考回显；实时求解器不据此投影或拒绝缆型。
+        min_bending_radius_m=None,
         integration_time_step_max_s=_REALTIME_INTEGRATION_TIME_STEP_MAX_S,
     )
 
@@ -699,6 +772,22 @@ def _optional_positive(
     value = _number(raw)
     if value is None or value <= 0.0:
         errors[f"{group}.{name}"] = "must be a positive finite number"
+        return None
+    return value
+
+
+def _optional_nonnegative(
+    values: dict[str, Any],
+    name: str,
+    group: str,
+    errors: dict[str, str],
+) -> float | None:
+    raw = values.get(name)
+    if raw is None:
+        return None
+    value = _number(raw)
+    if value is None or value < 0.0:
+        errors[f"{group}.{name}"] = "must be a non-negative finite number"
         return None
     return value
 

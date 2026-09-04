@@ -17,7 +17,11 @@
 from __future__ import annotations
 
 import math
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from typing import Callable, Iterator, Mapping
 
 from .axial_constraints import axial_constraint_residual_m, solve_global_axial_constraint_step
 from .contact import (
@@ -62,12 +66,192 @@ _KNOWN_PLOUGH_RMIN_EXCLUDED_TAIL_NODES = 2
 _KNOWN_PLOUGH_XPBD_MIN_ITERATIONS = 1
 _KNOWN_PLOUGH_XPBD_ITERATIONS = 100
 _KNOWN_PLOUGH_AXIAL_RESIDUAL_TOLERANCE_M = 1.0e-10
+# XPBD compliant angle equilibrium is C(theta)+alpha_tilde*lambda=0.  This
+# dimensionless angular tolerance is independent of the axial length tolerance.
+_KNOWN_PLOUGH_BENDING_EQUILIBRIUM_RESIDUAL_TOLERANCE_RAD = 1.0e-6
 _REMESH_PROJECTION_MAX_ITERATIONS = 6000
 _REMESH_PROJECTION_REL_TOLERANCE = 1.0e-12
+# 本版本的尾部粗化只允许修改局部窗口。12 段是基于失败 fixture 首次可行
+# window=8 再留 50% 工程裕量的可审计安全策略，不是物理定律；8/12/16
+# 敏感性留给后续独立基准。搜索还必须保留至少一个未修改前缀段。
+_MAX_LOCAL_TAIL_REMESH_WINDOW_SEGMENTS = 12
 
 
 class CableGeometryInfeasibleError(RuntimeError):
     """请求的端点几何与活动缆长无法形成可行离散缆型。"""
+
+
+@dataclass(frozen=True)
+class _SignedEnergyCumulative:
+    signed_per_linear_density_m3_s2: float = 0.0
+    positive_per_linear_density_m3_s2: float = 0.0
+    negative_per_linear_density_m3_s2: float = 0.0
+    absolute_per_linear_density_m3_s2: float = 0.0
+
+
+@dataclass(frozen=True)
+class _UniformAleRemapDecompositionAudit:
+    """Consistent-P1 remap operator audit; not a system-total energy budget."""
+
+    event_count_cumulative: int = 0
+    free: _SignedEnergyCumulative = _SignedEnergyCumulative()
+    constraint: _SignedEnergyCumulative = _SignedEnergyCumulative()
+    total: _SignedEnergyCumulative = _SignedEnergyCumulative()
+    free_left_endpoint_velocity_residual_mps: Vector3 = (0.0, 0.0, 0.0)
+    free_right_endpoint_velocity_residual_mps: Vector3 = (0.0, 0.0, 0.0)
+    free_momentum_residual_per_linear_density_m2_s: Vector3 = (0.0, 0.0, 0.0)
+    last_cell_kinetic_energy_per_linear_density_m3_s2: float = 0.0
+    last_free_kinetic_energy_per_linear_density_m3_s2: float = 0.0
+    last_resolved_kinetic_energy_per_linear_density_m3_s2: float = 0.0
+    last_delta_free_per_linear_density_m3_s2: float = 0.0
+    last_delta_constraint_per_linear_density_m3_s2: float = 0.0
+    last_delta_total_per_linear_density_m3_s2: float = 0.0
+    last_left_endpoint_material_velocity_mps: Vector3 = (0.0, 0.0, 0.0)
+    last_right_endpoint_material_velocity_mps: Vector3 = (0.0, 0.0, 0.0)
+    last_target_momentum_per_linear_density_m2_s: Vector3 = (0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True)
+class _UniformAleShadowEvent:
+    """Non-authoritative uniform-ALE observation; never enters solver state."""
+
+    status: str
+    failure_stage: str | None
+    exception_type: str | None
+    message: str | None
+    event_count_cumulative: int
+    element_count: int
+    active_length_m: float
+    payout_increment_m: float
+    laydown_increment_m: float
+    k_cell_per_linear_density_m3_s2: float | None
+    k_free_per_linear_density_m3_s2: float | None
+    k_closest_per_linear_density_m3_s2: float | None
+    k_min_per_linear_density_m3_s2: float | None
+    k_candidate_per_linear_density_m3_s2: float | None
+    delta_free_per_linear_density_m3_s2: float | None
+    delta_constraint_per_linear_density_m3_s2: float | None
+    delta_total_per_linear_density_m3_s2: float | None
+    candidate_minus_closest_per_linear_density_m3_s2: float | None
+    fidelity: float | None
+    p1_velocity_distance_to_closest_m3_over_2_s: float | None
+    free_left_endpoint_residual_mps: float | None
+    free_right_endpoint_residual_mps: float | None
+    resolved_endpoint_residual_mps: float | None
+    candidate_endpoint_residual_mps: float | None
+    endpoint_tolerance_mps: float | None
+    free_momentum_residual_per_linear_density_m2_s: float | None
+    resolved_momentum_residual_per_linear_density_m2_s: float | None
+    candidate_momentum_residual_per_linear_density_m2_s: float | None
+    momentum_tolerance_per_linear_density_m2_s: float | None
+    source_p1_momentum_residual_per_linear_density_m2_s: float | None
+    source_p1_momentum_tolerance_per_linear_density_m2_s: float | None
+    source_p1_energy_residual_per_linear_density_m3_s2: float | None
+    source_p1_energy_tolerance_per_linear_density_m3_s2: float | None
+    candidate_energy_tolerance_per_linear_density_m3_s2: float | None
+    shadow_compute_wall_s: float
+
+
+class _UniformAleShadowCapture:
+    def __init__(self, observer: Callable[[_UniformAleShadowEvent], None] | None = None):
+        self._observer = observer
+        self._events: list[_UniformAleShadowEvent] = []
+
+    @property
+    def events(self) -> tuple[_UniformAleShadowEvent, ...]:
+        return tuple(self._events)
+
+    def drain(self) -> tuple[_UniformAleShadowEvent, ...]:
+        events = tuple(self._events)
+        self._events.clear()
+        return events
+
+    def publish(self, event: _UniformAleShadowEvent) -> None:
+        self._events.append(event)
+        if self._observer is None:
+            return
+        try:
+            self._observer(event)
+        except Exception as exc:  # Shadow observers can never alter authority state.
+            self._events.append(replace(
+                event,
+                status="failed",
+                failure_stage="observer",
+                exception_type=type(exc).__name__,
+                message=str(exc),
+                shadow_compute_wall_s=0.0,
+            ))
+
+
+_UNIFORM_ALE_SHADOW_CAPTURE: ContextVar[_UniformAleShadowCapture | None] = ContextVar(
+    "uniform_ale_shadow_capture", default=None
+)
+
+
+@contextmanager
+def _capture_uniform_ale_shadow_events(
+    observer: Callable[[_UniformAleShadowEvent], None] | None = None,
+) -> Iterator[_UniformAleShadowCapture]:
+    """Enable a context-local diagnostic observer; production authority is unchanged."""
+
+    capture = _UniformAleShadowCapture(observer)
+    token = _UNIFORM_ALE_SHADOW_CAPTURE.set(capture)
+    try:
+        yield capture
+    finally:
+        _UNIFORM_ALE_SHADOW_CAPTURE.reset(token)
+
+
+def _uniform_ale_shadow_failure_event(
+    *,
+    stage: str,
+    exc: Exception,
+    event_count_cumulative: int,
+    element_count: int,
+    active_length_m: float,
+    payout_increment_m: float,
+    laydown_increment_m: float,
+    shadow_compute_wall_s: float,
+    evidence: Mapping[str, float | None] | None = None,
+) -> _UniformAleShadowEvent:
+    evidence = {} if evidence is None else evidence
+    return _UniformAleShadowEvent(
+        status="failed",
+        failure_stage=stage,
+        exception_type=type(exc).__name__,
+        message=str(exc),
+        event_count_cumulative=event_count_cumulative,
+        element_count=element_count,
+        active_length_m=active_length_m,
+        payout_increment_m=payout_increment_m,
+        laydown_increment_m=laydown_increment_m,
+        k_cell_per_linear_density_m3_s2=evidence.get("k_cell_per_linear_density_m3_s2"),
+        k_free_per_linear_density_m3_s2=evidence.get("k_free_per_linear_density_m3_s2"),
+        k_closest_per_linear_density_m3_s2=evidence.get("k_closest_per_linear_density_m3_s2"),
+        k_min_per_linear_density_m3_s2=evidence.get("k_min_per_linear_density_m3_s2"),
+        k_candidate_per_linear_density_m3_s2=evidence.get("k_candidate_per_linear_density_m3_s2"),
+        delta_free_per_linear_density_m3_s2=evidence.get("delta_free_per_linear_density_m3_s2"),
+        delta_constraint_per_linear_density_m3_s2=evidence.get("delta_constraint_per_linear_density_m3_s2"),
+        delta_total_per_linear_density_m3_s2=evidence.get("delta_total_per_linear_density_m3_s2"),
+        candidate_minus_closest_per_linear_density_m3_s2=evidence.get("candidate_minus_closest_per_linear_density_m3_s2"),
+        fidelity=evidence.get("fidelity"),
+        p1_velocity_distance_to_closest_m3_over_2_s=evidence.get("p1_velocity_distance_to_closest_m3_over_2_s"),
+        free_left_endpoint_residual_mps=evidence.get("free_left_endpoint_residual_mps"),
+        free_right_endpoint_residual_mps=evidence.get("free_right_endpoint_residual_mps"),
+        resolved_endpoint_residual_mps=evidence.get("resolved_endpoint_residual_mps"),
+        candidate_endpoint_residual_mps=evidence.get("candidate_endpoint_residual_mps"),
+        endpoint_tolerance_mps=evidence.get("endpoint_tolerance_mps"),
+        free_momentum_residual_per_linear_density_m2_s=evidence.get("free_momentum_residual_per_linear_density_m2_s"),
+        resolved_momentum_residual_per_linear_density_m2_s=evidence.get("resolved_momentum_residual_per_linear_density_m2_s"),
+        candidate_momentum_residual_per_linear_density_m2_s=evidence.get("candidate_momentum_residual_per_linear_density_m2_s"),
+        momentum_tolerance_per_linear_density_m2_s=evidence.get("momentum_tolerance_per_linear_density_m2_s"),
+        source_p1_momentum_residual_per_linear_density_m2_s=evidence.get("source_p1_momentum_residual_per_linear_density_m2_s"),
+        source_p1_momentum_tolerance_per_linear_density_m2_s=evidence.get("source_p1_momentum_tolerance_per_linear_density_m2_s"),
+        source_p1_energy_residual_per_linear_density_m3_s2=evidence.get("source_p1_energy_residual_per_linear_density_m3_s2"),
+        source_p1_energy_tolerance_per_linear_density_m3_s2=evidence.get("source_p1_energy_tolerance_per_linear_density_m3_s2"),
+        candidate_energy_tolerance_per_linear_density_m3_s2=evidence.get("candidate_energy_tolerance_per_linear_density_m3_s2"),
+        shadow_compute_wall_s=shadow_compute_wall_s,
+    )
 
 
 # 状态记录将网格运动学与守恒材料数据分开保存。
@@ -101,8 +285,31 @@ class DynamicLayingState:
     axial_constraint_residual_m: float = 0.0
     material_remap_energy_error_per_linear_density_m3_s2: float = 0.0
     material_remap_energy_error_cumulative_per_linear_density_m3_s2: float = 0.0
+    material_remap_event_count_cumulative: int = 0
+    material_remap_energy_positive_cumulative_per_linear_density_m3_s2: float = 0.0
+    # Negative contribution is retained with its sign; absolute is total variation.
+    material_remap_energy_negative_cumulative_per_linear_density_m3_s2: float = 0.0
+    material_remap_energy_absolute_cumulative_per_linear_density_m3_s2: float = 0.0
+    uniform_ale_remap_decomposition: _UniformAleRemapDecompositionAudit = (
+        _UniformAleRemapDecompositionAudit()
+    )
     # 固定端点/全局动量投影引入的数值能量增量。
     material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2: float = 0.0
+    # 以下尾部粗化能量只指集中结构/网格速度动能，不是材料控制体权威动量或动能，
+    # 也不重复计入上面的 material-remap 控制体能量字段。current 字段对应最近一个
+    # 内部时间步；max/min/cumulative 字段跨内部步累计。
+    tail_remesh_event_count: int = 0
+    tail_remesh_event_count_cumulative: int = 0
+    # current 内最后一个事件的窗口/fidelity；无 current 事件时分别为 0/1。
+    tail_remesh_selected_window_segments: int = 0
+    tail_remesh_max_window_segments: int = 0
+    tail_remesh_velocity_fidelity: float = 1.0
+    tail_remesh_min_velocity_fidelity: float = 1.0
+    tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2: float = 0.0
+    tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2: float = 0.0
+    tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2: float = 0.0
+    tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2: float = 0.0
+    tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2: float = 0.0
 
     @property
     def suspended_length_m(self) -> float:
@@ -166,6 +373,910 @@ class _MaterialSliceIntegral:
     mass_kg: float
     momentum_kg_mps: Vector3
     kinetic_energy_j: float
+
+
+@dataclass(frozen=True)
+class _VelocityTransferResult:
+    velocities: list[Vector3]
+    fidelity: float
+    old_lumped_kinetic_energy_per_linear_density_m3_s2: float
+    new_lumped_kinetic_energy_per_linear_density_m3_s2: float
+
+
+@dataclass(frozen=True)
+class _ConsistentP1EnergyBoundedVelocityCandidate:
+    velocities: tuple[Vector3, ...]
+    fidelity: float
+    minimum_energy_per_linear_density_m3_s2: float
+    candidate_energy_per_linear_density_m3_s2: float
+
+
+@dataclass(frozen=True)
+class _EqualFlowUniformAleOperatorEvent:
+    candidate_applied: bool
+    velocity_fidelity: float
+    p1_velocity_distance_to_closest_m3_over_2_s: float
+    candidate_delta_from_cell_per_linear_density_m3_s2: float
+    candidate_minus_closest_per_linear_density_m3_s2: float
+    candidate_dissipation_per_linear_density_m3_s2: float
+    endpoint_gate_passed: bool
+    resolved_momentum_residual_per_linear_density_m2_s: float
+    candidate_momentum_residual_per_linear_density_m2_s: float
+    momentum_residual_per_linear_density_m2_s: float
+    momentum_tolerance_per_linear_density_m2_s: float
+    energy_gate_passed: bool
+    source_p1_gate_passed: bool
+    source_p1_momentum_residual_per_linear_density_m2_s: float
+    source_p1_momentum_tolerance_per_linear_density_m2_s: float
+    source_p1_energy_residual_per_linear_density_m3_s2: float
+    source_p1_energy_tolerance_per_linear_density_m3_s2: float
+
+
+@dataclass(frozen=True)
+class _EqualFlowUniformAleOperatorResult:
+    state: DynamicLayingState
+    events: tuple[_EqualFlowUniformAleOperatorEvent, ...]
+
+
+def _consistent_p1_minimum_energy_velocity_field(
+    *,
+    rest_lengths_m: tuple[float, ...],
+    left_endpoint_velocity_mps: Vector3,
+    right_endpoint_velocity_mps: Vector3,
+    target_total_momentum_per_linear_density_m2_s: Vector3,
+) -> tuple[Vector3, ...] | None:
+    """Minimise consistent-P1 kinetic energy on the endpoint/momentum affine set."""
+
+    if not rest_lengths_m or any(length <= _MIN_LENGTH for length in rest_lengths_m):
+        raise ValueError("consistent-P1 minimum energy requires positive segment lengths")
+    if len(rest_lengths_m) == 1:
+        only = (left_endpoint_velocity_mps, right_endpoint_velocity_mps)
+        residual = _sub(
+            _consistent_linear_material_momentum(list(only), list(rest_lengths_m)),
+            target_total_momentum_per_linear_density_m2_s,
+        )
+        tolerance = 64.0 * math.ulp(max(_norm(target_total_momentum_per_linear_density_m2_s), 1.0))
+        return only if _norm(residual) <= tolerance else None
+    cells = tuple(_MaterialCellIntegral(length_m=length) for length in rest_lengths_m)
+    field = _material_node_velocities_from_cells(
+        cells,
+        rest_lengths_m,
+        left_endpoint_velocity_mps=left_endpoint_velocity_mps,
+        right_endpoint_velocity_mps=right_endpoint_velocity_mps,
+        l2_rhs_per_linear_density_m2_s=tuple(
+            (0.0, 0.0, 0.0) for _ in range(len(rest_lengths_m) + 1)
+        ),
+        target_total_momentum_per_linear_density_m2_s=(
+            target_total_momentum_per_linear_density_m2_s
+        ),
+    )
+    residual = _sub(
+        _consistent_linear_material_momentum(list(field), list(rest_lengths_m)),
+        target_total_momentum_per_linear_density_m2_s,
+    )
+    tolerance = 64.0 * math.ulp(max(_norm(target_total_momentum_per_linear_density_m2_s), 1.0))
+    return field if _norm(residual) <= tolerance else None
+
+
+def _consistent_p1_energy_bounded_maximum_fidelity_candidate(
+    *,
+    closest_velocities: tuple[Vector3, ...],
+    rest_lengths_m: tuple[float, ...],
+    left_endpoint_velocity_mps: Vector3,
+    right_endpoint_velocity_mps: Vector3,
+    target_total_momentum_per_linear_density_m2_s: Vector3,
+    cell_kinetic_energy_per_linear_density_m3_s2: float,
+) -> _ConsistentP1EnergyBoundedVelocityCandidate | None:
+    """Pure candidate only; it is intentionally not wired into uniform ALE production."""
+
+    minimum = _consistent_p1_minimum_energy_velocity_field(
+        rest_lengths_m=rest_lengths_m,
+        left_endpoint_velocity_mps=left_endpoint_velocity_mps,
+        right_endpoint_velocity_mps=right_endpoint_velocity_mps,
+        target_total_momentum_per_linear_density_m2_s=(
+            target_total_momentum_per_linear_density_m2_s
+        ),
+    )
+    if minimum is None or len(closest_velocities) != len(rest_lengths_m) + 1:
+        return None
+    minimum_energy = _consistent_linear_structural_kinetic_energy_per_linear_density(
+        list(minimum), list(rest_lengths_m)
+    )
+    closest_energy = _consistent_linear_structural_kinetic_energy_per_linear_density(
+        list(closest_velocities), list(rest_lengths_m)
+    )
+    tolerance = _kinetic_energy_roundoff_tolerance(
+        cell_kinetic_energy_per_linear_density_m3_s2,
+        max(minimum_energy, closest_energy),
+        old_node_count=len(closest_velocities),
+        new_node_count=len(closest_velocities),
+    )
+    limit = cell_kinetic_energy_per_linear_density_m3_s2 + tolerance
+    if minimum_energy > limit:
+        return None
+    if closest_energy <= limit:
+        fidelity = 1.0
+        candidate = closest_velocities
+    else:
+        low = 0.0
+        high = 1.0
+        for _ in range(80):
+            trial = 0.5 * (low + high)
+            velocities = tuple(
+                _add(left, _mul(_sub(right, left), trial))
+                for left, right in zip(minimum, closest_velocities)
+            )
+            energy = _consistent_linear_structural_kinetic_energy_per_linear_density(
+                list(velocities), list(rest_lengths_m)
+            )
+            if energy <= limit:
+                low = trial
+            else:
+                high = trial
+        fidelity = low
+        candidate = tuple(
+            _add(left, _mul(_sub(right, left), fidelity))
+            for left, right in zip(minimum, closest_velocities)
+        )
+    candidate_energy = _consistent_linear_structural_kinetic_energy_per_linear_density(
+        list(candidate), list(rest_lengths_m)
+    )
+    momentum_residual = _sub(
+        _consistent_linear_material_momentum(list(candidate), list(rest_lengths_m)),
+        target_total_momentum_per_linear_density_m2_s,
+    )
+    momentum_tolerance = 64.0 * math.ulp(max(_norm(target_total_momentum_per_linear_density_m2_s), 1.0))
+    if (
+        candidate[0] != left_endpoint_velocity_mps
+        or candidate[-1] != right_endpoint_velocity_mps
+        or _norm(momentum_residual) > momentum_tolerance
+        or candidate_energy > limit
+    ):
+        return None
+    return _ConsistentP1EnergyBoundedVelocityCandidate(
+        velocities=candidate,
+        fidelity=fidelity,
+        minimum_energy_per_linear_density_m3_s2=minimum_energy,
+        candidate_energy_per_linear_density_m3_s2=candidate_energy,
+    )
+
+
+def _observe_uniform_ale_shadow(
+    *,
+    event_count_cumulative: int,
+    rest_lengths_m: tuple[float, ...],
+    active_length_m: float,
+    payout_increment_m: float,
+    laydown_increment_m: float,
+    free_velocities: tuple[Vector3, ...],
+    closest_velocities: tuple[Vector3, ...],
+    left_endpoint_velocity_mps: Vector3,
+    right_endpoint_velocity_mps: Vector3,
+    target_momentum_per_linear_density_m2_s: Vector3,
+    k_cell_per_linear_density_m3_s2: float,
+    k_free_per_linear_density_m3_s2: float,
+    k_closest_per_linear_density_m3_s2: float,
+    source_p1_momentum_residual_per_linear_density_m2_s: float,
+    source_p1_momentum_tolerance_per_linear_density_m2_s: float,
+    source_p1_energy_residual_per_linear_density_m3_s2: float,
+    source_p1_energy_tolerance_per_linear_density_m3_s2: float,
+) -> None:
+    capture = _UNIFORM_ALE_SHADOW_CAPTURE.get()
+    if capture is None:
+        return
+    started = time.perf_counter()
+    failure_stage = "candidate_compute"
+    evidence: dict[str, float | None] = {
+        "k_cell_per_linear_density_m3_s2": k_cell_per_linear_density_m3_s2,
+        "k_free_per_linear_density_m3_s2": k_free_per_linear_density_m3_s2,
+        "k_closest_per_linear_density_m3_s2": k_closest_per_linear_density_m3_s2,
+        "delta_free_per_linear_density_m3_s2": (
+            k_free_per_linear_density_m3_s2 - k_cell_per_linear_density_m3_s2
+        ),
+        "delta_constraint_per_linear_density_m3_s2": (
+            k_closest_per_linear_density_m3_s2 - k_free_per_linear_density_m3_s2
+        ),
+        "delta_total_per_linear_density_m3_s2": (
+            k_closest_per_linear_density_m3_s2 - k_cell_per_linear_density_m3_s2
+        ),
+        "free_left_endpoint_residual_mps": _norm(
+            _sub(free_velocities[0], left_endpoint_velocity_mps)
+        ),
+        "free_right_endpoint_residual_mps": _norm(
+            _sub(free_velocities[-1], right_endpoint_velocity_mps)
+        ),
+        "source_p1_momentum_residual_per_linear_density_m2_s": (
+            source_p1_momentum_residual_per_linear_density_m2_s
+        ),
+        "source_p1_momentum_tolerance_per_linear_density_m2_s": (
+            source_p1_momentum_tolerance_per_linear_density_m2_s
+        ),
+        "source_p1_energy_residual_per_linear_density_m3_s2": (
+            source_p1_energy_residual_per_linear_density_m3_s2
+        ),
+        "source_p1_energy_tolerance_per_linear_density_m3_s2": (
+            source_p1_energy_tolerance_per_linear_density_m3_s2
+        ),
+    }
+    try:
+        minimum = _consistent_p1_minimum_energy_velocity_field(
+            rest_lengths_m=rest_lengths_m,
+            left_endpoint_velocity_mps=left_endpoint_velocity_mps,
+            right_endpoint_velocity_mps=right_endpoint_velocity_mps,
+            target_total_momentum_per_linear_density_m2_s=(
+                target_momentum_per_linear_density_m2_s
+            ),
+        )
+        candidate = _consistent_p1_energy_bounded_maximum_fidelity_candidate(
+            closest_velocities=closest_velocities,
+            rest_lengths_m=rest_lengths_m,
+            left_endpoint_velocity_mps=left_endpoint_velocity_mps,
+            right_endpoint_velocity_mps=right_endpoint_velocity_mps,
+            target_total_momentum_per_linear_density_m2_s=(
+                target_momentum_per_linear_density_m2_s
+            ),
+            cell_kinetic_energy_per_linear_density_m3_s2=(
+                k_cell_per_linear_density_m3_s2
+            ),
+        )
+        if minimum is None or candidate is None:
+            failure_stage = "affine_energy_feasibility_gate"
+            raise RuntimeError("uniform-ALE shadow affine set is energy-infeasible")
+        k_min = _consistent_linear_structural_kinetic_energy_per_linear_density(
+            list(minimum), list(rest_lengths_m)
+        )
+        candidate_momentum = _consistent_linear_material_momentum(
+            list(candidate.velocities), list(rest_lengths_m)
+        )
+        closest_momentum = _consistent_linear_material_momentum(
+            list(closest_velocities), list(rest_lengths_m)
+        )
+        free_momentum = _consistent_linear_material_momentum(
+            list(free_velocities), list(rest_lengths_m)
+        )
+        momentum_scale = max(
+            _norm(target_momentum_per_linear_density_m2_s),
+            _norm(candidate_momentum),
+            _norm(closest_momentum),
+            1.0,
+        )
+        momentum_tolerance = 64.0 * math.ulp(momentum_scale)
+        endpoint_scale = max(
+            _norm(left_endpoint_velocity_mps),
+            _norm(right_endpoint_velocity_mps),
+            1.0,
+        )
+        endpoint_tolerance = 64.0 * math.ulp(endpoint_scale)
+        resolved_endpoint_residual = max(
+            _norm(_sub(closest_velocities[0], left_endpoint_velocity_mps)),
+            _norm(_sub(closest_velocities[-1], right_endpoint_velocity_mps)),
+        )
+        candidate_endpoint_residual = max(
+            _norm(_sub(candidate.velocities[0], left_endpoint_velocity_mps)),
+            _norm(_sub(candidate.velocities[-1], right_endpoint_velocity_mps)),
+        )
+        candidate_energy_tolerance = _kinetic_energy_roundoff_tolerance(
+            k_cell_per_linear_density_m3_s2,
+            candidate.candidate_energy_per_linear_density_m3_s2,
+            old_node_count=len(closest_velocities),
+            new_node_count=len(candidate.velocities),
+        )
+        resolved_momentum_residual = _norm(
+            _sub(closest_momentum, target_momentum_per_linear_density_m2_s)
+        )
+        candidate_momentum_residual = _norm(
+            _sub(candidate_momentum, target_momentum_per_linear_density_m2_s)
+        )
+        evidence.update({
+            "k_min_per_linear_density_m3_s2": k_min,
+            "k_candidate_per_linear_density_m3_s2": candidate.candidate_energy_per_linear_density_m3_s2,
+            "candidate_minus_closest_per_linear_density_m3_s2": (
+                candidate.candidate_energy_per_linear_density_m3_s2 - k_closest_per_linear_density_m3_s2
+            ),
+            "fidelity": candidate.fidelity,
+            "resolved_endpoint_residual_mps": resolved_endpoint_residual,
+            "candidate_endpoint_residual_mps": candidate_endpoint_residual,
+            "endpoint_tolerance_mps": endpoint_tolerance,
+            "free_momentum_residual_per_linear_density_m2_s": _norm(
+                _sub(free_momentum, target_momentum_per_linear_density_m2_s)
+            ),
+            "resolved_momentum_residual_per_linear_density_m2_s": resolved_momentum_residual,
+            "candidate_momentum_residual_per_linear_density_m2_s": candidate_momentum_residual,
+            "momentum_tolerance_per_linear_density_m2_s": momentum_tolerance,
+            "candidate_energy_tolerance_per_linear_density_m3_s2": candidate_energy_tolerance,
+        })
+        for gate_stage, residual, tolerance in (
+            ("resolved_endpoint_gate", resolved_endpoint_residual, endpoint_tolerance),
+            ("candidate_endpoint_gate", candidate_endpoint_residual, endpoint_tolerance),
+            ("resolved_momentum_gate", resolved_momentum_residual, momentum_tolerance),
+            ("candidate_momentum_gate", candidate_momentum_residual, momentum_tolerance),
+        ):
+            if residual > tolerance:
+                failure_stage = gate_stage
+                raise RuntimeError(
+                    f"uniform-ALE shadow {gate_stage} failed: residual={residual}, tolerance={tolerance}"
+                )
+        if candidate.candidate_energy_per_linear_density_m3_s2 > (
+            k_cell_per_linear_density_m3_s2 + candidate_energy_tolerance
+        ):
+            failure_stage = "candidate_energy_gate"
+            raise RuntimeError(
+                "uniform-ALE shadow candidate_energy_gate failed: "
+                f"candidate={candidate.candidate_energy_per_linear_density_m3_s2}, "
+                f"cell={k_cell_per_linear_density_m3_s2}, tolerance={candidate_energy_tolerance}"
+            )
+        difference = [
+            _sub(candidate_velocity, closest_velocity)
+            for candidate_velocity, closest_velocity in zip(
+                candidate.velocities, closest_velocities
+            )
+        ]
+        p1_distance = math.sqrt(max(
+            0.0,
+            2.0 * _consistent_linear_structural_kinetic_energy_per_linear_density(
+                difference, list(rest_lengths_m)
+            ),
+        ))
+        event = _UniformAleShadowEvent(
+            status="ok",
+            failure_stage=None,
+            exception_type=None,
+            message=None,
+            event_count_cumulative=event_count_cumulative,
+            element_count=len(rest_lengths_m),
+            active_length_m=active_length_m,
+            payout_increment_m=payout_increment_m,
+            laydown_increment_m=laydown_increment_m,
+            k_cell_per_linear_density_m3_s2=k_cell_per_linear_density_m3_s2,
+            k_free_per_linear_density_m3_s2=k_free_per_linear_density_m3_s2,
+            k_closest_per_linear_density_m3_s2=k_closest_per_linear_density_m3_s2,
+            k_min_per_linear_density_m3_s2=k_min,
+            k_candidate_per_linear_density_m3_s2=(
+                candidate.candidate_energy_per_linear_density_m3_s2
+            ),
+            delta_free_per_linear_density_m3_s2=(
+                k_free_per_linear_density_m3_s2 - k_cell_per_linear_density_m3_s2
+            ),
+            delta_constraint_per_linear_density_m3_s2=(
+                k_closest_per_linear_density_m3_s2 - k_free_per_linear_density_m3_s2
+            ),
+            delta_total_per_linear_density_m3_s2=(
+                k_closest_per_linear_density_m3_s2 - k_cell_per_linear_density_m3_s2
+            ),
+            candidate_minus_closest_per_linear_density_m3_s2=(
+                candidate.candidate_energy_per_linear_density_m3_s2
+                - k_closest_per_linear_density_m3_s2
+            ),
+            fidelity=candidate.fidelity,
+            p1_velocity_distance_to_closest_m3_over_2_s=p1_distance,
+            free_left_endpoint_residual_mps=_norm(
+                _sub(free_velocities[0], left_endpoint_velocity_mps)
+            ),
+            free_right_endpoint_residual_mps=_norm(
+                _sub(free_velocities[-1], right_endpoint_velocity_mps)
+            ),
+            resolved_endpoint_residual_mps=resolved_endpoint_residual,
+            candidate_endpoint_residual_mps=candidate_endpoint_residual,
+            endpoint_tolerance_mps=endpoint_tolerance,
+            free_momentum_residual_per_linear_density_m2_s=_norm(
+                _sub(free_momentum, target_momentum_per_linear_density_m2_s)
+            ),
+            resolved_momentum_residual_per_linear_density_m2_s=_norm(
+                _sub(closest_momentum, target_momentum_per_linear_density_m2_s)
+            ),
+            candidate_momentum_residual_per_linear_density_m2_s=_norm(
+                _sub(candidate_momentum, target_momentum_per_linear_density_m2_s)
+            ),
+            momentum_tolerance_per_linear_density_m2_s=momentum_tolerance,
+            source_p1_momentum_residual_per_linear_density_m2_s=(
+                source_p1_momentum_residual_per_linear_density_m2_s
+            ),
+            source_p1_momentum_tolerance_per_linear_density_m2_s=(
+                source_p1_momentum_tolerance_per_linear_density_m2_s
+            ),
+            source_p1_energy_residual_per_linear_density_m3_s2=(
+                source_p1_energy_residual_per_linear_density_m3_s2
+            ),
+            source_p1_energy_tolerance_per_linear_density_m3_s2=(
+                source_p1_energy_tolerance_per_linear_density_m3_s2
+            ),
+            candidate_energy_tolerance_per_linear_density_m3_s2=(
+                candidate_energy_tolerance
+            ),
+            shadow_compute_wall_s=time.perf_counter() - started,
+        )
+        capture.publish(event)
+    except Exception as exc:
+        capture.publish(_uniform_ale_shadow_failure_event(
+            stage=failure_stage,
+            exc=exc,
+            event_count_cumulative=event_count_cumulative,
+            element_count=len(rest_lengths_m),
+            active_length_m=active_length_m,
+            payout_increment_m=payout_increment_m,
+            laydown_increment_m=laydown_increment_m,
+            shadow_compute_wall_s=time.perf_counter() - started,
+            evidence=evidence,
+        ))
+
+
+def _replace_latest_uniform_ale_energy_event(
+    state: DynamicLayingState,
+    *,
+    closest_material_velocities: tuple[Vector3, ...],
+    candidate: _ConsistentP1EnergyBoundedVelocityCandidate,
+    transport_speed_mps: float,
+    source_shadow_event: _UniformAleShadowEvent,
+) -> tuple[DynamicLayingState, _EqualFlowUniformAleOperatorEvent]:
+    """Apply a pure shadow candidate after one completed uniform-ALE operator event."""
+
+    audit = state.uniform_ale_remap_decomposition
+    old_free = audit.last_delta_free_per_linear_density_m3_s2
+    old_constraint = audit.last_delta_constraint_per_linear_density_m3_s2
+    old_total = audit.last_delta_total_per_linear_density_m3_s2
+    cell_energy = audit.last_cell_kinetic_energy_per_linear_density_m3_s2
+    candidate_energy = candidate.candidate_energy_per_linear_density_m3_s2
+    new_constraint = candidate_energy - audit.last_free_kinetic_energy_per_linear_density_m3_s2
+    new_total = candidate_energy - cell_energy
+
+    def replaced(
+        cumulative: _SignedEnergyCumulative,
+        old_increment: float,
+        new_increment: float,
+    ) -> _SignedEnergyCumulative:
+        return _SignedEnergyCumulative(
+            signed_per_linear_density_m3_s2=math.fsum((
+                cumulative.signed_per_linear_density_m3_s2,
+                -old_increment,
+                new_increment,
+            )),
+            positive_per_linear_density_m3_s2=math.fsum((
+                cumulative.positive_per_linear_density_m3_s2,
+                -max(old_increment, 0.0),
+                max(new_increment, 0.0),
+            )),
+            negative_per_linear_density_m3_s2=math.fsum((
+                cumulative.negative_per_linear_density_m3_s2,
+                -min(old_increment, 0.0),
+                min(new_increment, 0.0),
+            )),
+            absolute_per_linear_density_m3_s2=math.fsum((
+                cumulative.absolute_per_linear_density_m3_s2,
+                -abs(old_increment),
+                abs(new_increment),
+            )),
+        )
+
+    candidate_velocities = candidate.velocities
+    segments = segment_vectors(state.positions)
+    flow_speeds = _node_material_flow_speeds(
+        state.rest_lengths_m,
+        fairlead_speed_mps=transport_speed_mps,
+        plough_speed_mps=transport_speed_mps,
+    )
+    grid_velocities = tuple(
+        _sub(
+            velocity,
+            _mul(_node_tangent(segments, index), flow_speeds[index]),
+        )
+        for index, velocity in enumerate(candidate_velocities)
+    )
+    control = state.known_plough_material_control_volume
+    if control is None:
+        raise RuntimeError("equal-flow shadow candidate requires material control cells")
+    candidate_cells = tuple(
+        replace(
+            cell,
+            momentum_per_linear_density_m2_s=_mul(
+                _add(left_velocity, right_velocity), 0.5 * cell.length_m
+            ),
+            kinetic_energy_per_linear_density_m3_s2=_linear_material_cell_kinetic_energy(
+                left_velocity, right_velocity, cell.length_m
+            ),
+        )
+        for cell, left_velocity, right_velocity in zip(
+            control.material_cells, candidate_velocities, candidate_velocities[1:]
+        )
+    )
+    new_audit = replace(
+        audit,
+        constraint=replaced(audit.constraint, old_constraint, new_constraint),
+        total=replaced(audit.total, old_total, new_total),
+        last_resolved_kinetic_energy_per_linear_density_m3_s2=candidate_energy,
+        last_delta_constraint_per_linear_density_m3_s2=new_constraint,
+        last_delta_total_per_linear_density_m3_s2=new_total,
+    )
+    total_cumulative = replaced(
+        _SignedEnergyCumulative(
+            signed_per_linear_density_m3_s2=(
+                state.material_remap_energy_error_cumulative_per_linear_density_m3_s2
+            ),
+            positive_per_linear_density_m3_s2=(
+                state.material_remap_energy_positive_cumulative_per_linear_density_m3_s2
+            ),
+            negative_per_linear_density_m3_s2=(
+                state.material_remap_energy_negative_cumulative_per_linear_density_m3_s2
+            ),
+            absolute_per_linear_density_m3_s2=(
+                state.material_remap_energy_absolute_cumulative_per_linear_density_m3_s2
+            ),
+        ),
+        old_total,
+        new_total,
+    )
+    candidate_state = replace(
+        state,
+        velocities=grid_velocities,
+        known_plough_material_control_volume=replace(
+            control, material_cells=candidate_cells
+        ),
+        material_remap_energy_error_per_linear_density_m3_s2=new_total,
+        material_remap_energy_error_cumulative_per_linear_density_m3_s2=(
+            total_cumulative.signed_per_linear_density_m3_s2
+        ),
+        material_remap_energy_positive_cumulative_per_linear_density_m3_s2=(
+            total_cumulative.positive_per_linear_density_m3_s2
+        ),
+        material_remap_energy_negative_cumulative_per_linear_density_m3_s2=(
+            total_cumulative.negative_per_linear_density_m3_s2
+        ),
+        material_remap_energy_absolute_cumulative_per_linear_density_m3_s2=(
+            total_cumulative.absolute_per_linear_density_m3_s2
+        ),
+        material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2=(
+            new_constraint
+        ),
+        uniform_ale_remap_decomposition=new_audit,
+    )
+    resolved_momentum = _consistent_linear_material_momentum(
+        list(candidate_velocities), list(state.rest_lengths_m)
+    )
+    momentum_residual = _norm(_sub(
+        resolved_momentum, audit.last_target_momentum_per_linear_density_m2_s
+    ))
+    momentum_tolerance = 64.0 * math.ulp(max(
+        _norm(resolved_momentum),
+        _norm(audit.last_target_momentum_per_linear_density_m2_s),
+        1.0,
+    ))
+    closest_momentum = _consistent_linear_material_momentum(
+        list(closest_material_velocities), list(state.rest_lengths_m)
+    )
+    resolved_momentum_residual = _norm(_sub(
+        closest_momentum, audit.last_target_momentum_per_linear_density_m2_s
+    ))
+    energy_tolerance = _kinetic_energy_roundoff_tolerance(
+        cell_energy,
+        candidate_energy,
+        old_node_count=len(state.positions),
+        new_node_count=len(state.positions),
+    )
+    endpoint_gate = (
+        candidate_velocities[0] == audit.last_left_endpoint_material_velocity_mps
+        and candidate_velocities[-1] == audit.last_right_endpoint_material_velocity_mps
+    )
+    energy_gate = candidate_energy <= cell_energy + energy_tolerance
+    if not endpoint_gate or momentum_residual > momentum_tolerance or not energy_gate:
+        raise RuntimeError("equal-flow shadow candidate violated a conservative gate")
+    difference = [
+        _sub(candidate_velocity, closest_velocity)
+        for candidate_velocity, closest_velocity in zip(
+            candidate_velocities, closest_material_velocities
+        )
+    ]
+    mass_distance = math.sqrt(max(
+        0.0,
+        2.0 * _consistent_linear_structural_kinetic_energy_per_linear_density(
+            difference, list(state.rest_lengths_m)
+        ),
+    ))
+    _validate_state(candidate_state)
+    return candidate_state, _EqualFlowUniformAleOperatorEvent(
+        candidate_applied=True,
+        velocity_fidelity=candidate.fidelity,
+        p1_velocity_distance_to_closest_m3_over_2_s=mass_distance,
+        candidate_delta_from_cell_per_linear_density_m3_s2=new_total,
+        candidate_minus_closest_per_linear_density_m3_s2=(
+            candidate_energy - audit.last_resolved_kinetic_energy_per_linear_density_m3_s2
+        ),
+        candidate_dissipation_per_linear_density_m3_s2=max(0.0, -new_total),
+        endpoint_gate_passed=endpoint_gate,
+        resolved_momentum_residual_per_linear_density_m2_s=resolved_momentum_residual,
+        candidate_momentum_residual_per_linear_density_m2_s=momentum_residual,
+        momentum_residual_per_linear_density_m2_s=momentum_residual,
+        momentum_tolerance_per_linear_density_m2_s=momentum_tolerance,
+        energy_gate_passed=energy_gate,
+        source_p1_gate_passed=(
+            source_shadow_event.source_p1_momentum_residual_per_linear_density_m2_s
+            <= source_shadow_event.source_p1_momentum_tolerance_per_linear_density_m2_s
+            and source_shadow_event.source_p1_energy_residual_per_linear_density_m3_s2
+            <= source_shadow_event.source_p1_energy_tolerance_per_linear_density_m3_s2
+        ),
+        source_p1_momentum_residual_per_linear_density_m2_s=(
+            source_shadow_event.source_p1_momentum_residual_per_linear_density_m2_s
+        ),
+        source_p1_momentum_tolerance_per_linear_density_m2_s=(
+            source_shadow_event.source_p1_momentum_tolerance_per_linear_density_m2_s
+        ),
+        source_p1_energy_residual_per_linear_density_m3_s2=(
+            source_shadow_event.source_p1_energy_residual_per_linear_density_m3_s2
+        ),
+        source_p1_energy_tolerance_per_linear_density_m3_s2=(
+            source_shadow_event.source_p1_energy_tolerance_per_linear_density_m3_s2
+        ),
+    )
+
+
+def _apply_known_plough_equal_flow_uniform_ale_operator(
+    state: DynamicLayingState,
+    *,
+    total_equal_flow_m: float,
+    composition_count: int,
+    transport_speed_mps: float,
+    apply_energy_bounded_candidate: bool,
+) -> _EqualFlowUniformAleOperatorResult:
+    """Pure equal-flow remap composition; no force solve or physical-time advance."""
+
+    if not math.isfinite(total_equal_flow_m) or total_equal_flow_m <= 0.0:
+        raise ValueError("total equal flow must be finite and positive")
+    if isinstance(composition_count, bool) or not isinstance(composition_count, int) or composition_count <= 0:
+        raise ValueError("composition count must be a positive integer")
+    if not math.isfinite(transport_speed_mps) or transport_speed_mps <= 0.0:
+        raise ValueError("transport speed must be finite and positive")
+    active_length = math.fsum(state.rest_lengths_m)
+    increment = total_equal_flow_m / composition_count
+    dt_s = increment / transport_speed_mps
+    current = state
+    events: list[_EqualFlowUniformAleOperatorEvent] = []
+    for _ in range(composition_count):
+        with _capture_uniform_ale_shadow_events() as source_capture:
+            current = _rezone_known_plough_uniform_ale(
+                current,
+                new_active_length_m=active_length,
+                element_count=len(current.rest_lengths_m),
+                payout_increment_m=increment,
+                laydown_increment_m=increment,
+                dt_s=dt_s,
+            )
+        source_events = source_capture.drain()
+        if len(source_events) != 1 or source_events[0].status != "ok":
+            raise RuntimeError("equal-flow operator source-P1 observation failed")
+        source_event = source_events[0]
+        audit = current.uniform_ale_remap_decomposition
+        segments = segment_vectors(current.positions)
+        flow_speeds = _node_material_flow_speeds(
+            current.rest_lengths_m,
+            fairlead_speed_mps=transport_speed_mps,
+            plough_speed_mps=transport_speed_mps,
+        )
+        closest = tuple(
+            _add(velocity, _mul(_node_tangent(segments, index), flow_speeds[index]))
+            for index, velocity in enumerate(current.velocities)
+        )
+        if apply_energy_bounded_candidate:
+            candidate = _consistent_p1_energy_bounded_maximum_fidelity_candidate(
+                closest_velocities=closest,
+                rest_lengths_m=current.rest_lengths_m,
+                left_endpoint_velocity_mps=audit.last_left_endpoint_material_velocity_mps,
+                right_endpoint_velocity_mps=audit.last_right_endpoint_material_velocity_mps,
+                target_total_momentum_per_linear_density_m2_s=(
+                    audit.last_target_momentum_per_linear_density_m2_s
+                ),
+                cell_kinetic_energy_per_linear_density_m3_s2=(
+                    audit.last_cell_kinetic_energy_per_linear_density_m3_s2
+                ),
+            )
+            if candidate is None:
+                raise RuntimeError("equal-flow shadow candidate affine set is energy-infeasible")
+            current, event = _replace_latest_uniform_ale_energy_event(
+                current,
+                closest_material_velocities=closest,
+                candidate=candidate,
+                transport_speed_mps=transport_speed_mps,
+                source_shadow_event=source_event,
+            )
+        else:
+            resolved_momentum = _consistent_linear_material_momentum(
+                list(closest), list(current.rest_lengths_m)
+            )
+            resolved_momentum_residual = _norm(_sub(
+                resolved_momentum, audit.last_target_momentum_per_linear_density_m2_s
+            ))
+            momentum_tolerance = 64.0 * math.ulp(max(
+                _norm(resolved_momentum),
+                _norm(audit.last_target_momentum_per_linear_density_m2_s),
+                1.0,
+            ))
+            events.append(_EqualFlowUniformAleOperatorEvent(
+                candidate_applied=False,
+                velocity_fidelity=1.0,
+                p1_velocity_distance_to_closest_m3_over_2_s=0.0,
+                candidate_delta_from_cell_per_linear_density_m3_s2=(
+                    audit.last_delta_total_per_linear_density_m3_s2
+                ),
+                candidate_minus_closest_per_linear_density_m3_s2=0.0,
+                candidate_dissipation_per_linear_density_m3_s2=max(
+                    0.0, -audit.last_delta_total_per_linear_density_m3_s2
+                ),
+                endpoint_gate_passed=True,
+                resolved_momentum_residual_per_linear_density_m2_s=(
+                    resolved_momentum_residual
+                ),
+                candidate_momentum_residual_per_linear_density_m2_s=(
+                    resolved_momentum_residual
+                ),
+                momentum_residual_per_linear_density_m2_s=resolved_momentum_residual,
+                momentum_tolerance_per_linear_density_m2_s=momentum_tolerance,
+                energy_gate_passed=(
+                    audit.last_delta_total_per_linear_density_m3_s2
+                    <= _kinetic_energy_roundoff_tolerance(
+                        audit.last_cell_kinetic_energy_per_linear_density_m3_s2,
+                        audit.last_resolved_kinetic_energy_per_linear_density_m3_s2,
+                        old_node_count=len(current.positions),
+                        new_node_count=len(current.positions),
+                    )
+                ),
+                source_p1_gate_passed=(
+                    source_event.source_p1_momentum_residual_per_linear_density_m2_s
+                    <= source_event.source_p1_momentum_tolerance_per_linear_density_m2_s
+                    and source_event.source_p1_energy_residual_per_linear_density_m3_s2
+                    <= source_event.source_p1_energy_tolerance_per_linear_density_m3_s2
+                ),
+                source_p1_momentum_residual_per_linear_density_m2_s=(
+                    source_event.source_p1_momentum_residual_per_linear_density_m2_s
+                ),
+                source_p1_momentum_tolerance_per_linear_density_m2_s=(
+                    source_event.source_p1_momentum_tolerance_per_linear_density_m2_s
+                ),
+                source_p1_energy_residual_per_linear_density_m3_s2=(
+                    source_event.source_p1_energy_residual_per_linear_density_m3_s2
+                ),
+                source_p1_energy_tolerance_per_linear_density_m3_s2=(
+                    source_event.source_p1_energy_tolerance_per_linear_density_m3_s2
+                ),
+            ))
+            continue
+        events.append(event)
+    return _EqualFlowUniformAleOperatorResult(state=current, events=tuple(events))
+
+
+@dataclass(frozen=True)
+class _TailRemeshResult:
+    """局部尾部粗化结果及集中结构/网格速度动能审计。"""
+
+    remeshed: tuple[
+        list[Vector3],
+        list[Vector3],
+        list[float],
+        list[bool],
+        list[float],
+        list[float],
+        list[float],
+        list[float],
+        list[float],
+    ]
+    selected_window_segments: int
+    velocity_fidelity: float
+    lumped_kinetic_energy_delta_per_linear_density_m3_s2: float
+
+
+def _accumulate_uniform_ale_energy_audit(
+    state: DynamicLayingState,
+    *,
+    delta_free_per_linear_density_m3_s2: float,
+    delta_constraint_per_linear_density_m3_s2: float,
+    delta_total_per_linear_density_m3_s2: float,
+    free_left_endpoint_velocity_residual_mps: Vector3,
+    free_right_endpoint_velocity_residual_mps: Vector3,
+    free_momentum_residual_per_linear_density_m2_s: Vector3,
+    cell_kinetic_energy_per_linear_density_m3_s2: float,
+    free_kinetic_energy_per_linear_density_m3_s2: float,
+    resolved_kinetic_energy_per_linear_density_m3_s2: float,
+    left_endpoint_material_velocity_mps: Vector3,
+    right_endpoint_material_velocity_mps: Vector3,
+    target_momentum_per_linear_density_m2_s: Vector3,
+) -> DynamicLayingState:
+    """Record one real uniform-ALE event, not a system-total energy budget."""
+
+    delta_free = float(delta_free_per_linear_density_m3_s2)
+    delta_constraint = float(delta_constraint_per_linear_density_m3_s2)
+    delta = float(delta_total_per_linear_density_m3_s2)
+    if not all(math.isfinite(value) for value in (delta_free, delta_constraint, delta)):
+        raise ValueError("uniform-ALE energy audit increments must be finite")
+    event_tolerance = 128.0 * math.ulp(
+        max(abs(delta_free), abs(delta_constraint), abs(delta), 1.0)
+    )
+    if abs(delta - math.fsum((delta_free, delta_constraint))) > event_tolerance:
+        raise RuntimeError("uniform-ALE event energy decomposition does not close")
+    residuals = (
+        free_left_endpoint_velocity_residual_mps,
+        free_right_endpoint_velocity_residual_mps,
+        free_momentum_residual_per_linear_density_m2_s,
+        left_endpoint_material_velocity_mps,
+        right_endpoint_material_velocity_mps,
+        target_momentum_per_linear_density_m2_s,
+    )
+    if not all(math.isfinite(component) for vector in residuals for component in vector):
+        raise ValueError("uniform-ALE free-field residuals must be finite")
+
+    def accumulated(previous: _SignedEnergyCumulative, increment: float) -> _SignedEnergyCumulative:
+        return _SignedEnergyCumulative(
+            signed_per_linear_density_m3_s2=math.fsum((
+                previous.signed_per_linear_density_m3_s2, increment,
+            )),
+            positive_per_linear_density_m3_s2=math.fsum((
+                previous.positive_per_linear_density_m3_s2, max(increment, 0.0),
+            )),
+            negative_per_linear_density_m3_s2=math.fsum((
+                previous.negative_per_linear_density_m3_s2, min(increment, 0.0),
+            )),
+            absolute_per_linear_density_m3_s2=math.fsum((
+                previous.absolute_per_linear_density_m3_s2, abs(increment),
+            )),
+        )
+
+    previous_audit = state.uniform_ale_remap_decomposition
+    audit = _UniformAleRemapDecompositionAudit(
+        event_count_cumulative=previous_audit.event_count_cumulative + 1,
+        free=accumulated(previous_audit.free, delta_free),
+        constraint=accumulated(previous_audit.constraint, delta_constraint),
+        total=accumulated(previous_audit.total, delta),
+        free_left_endpoint_velocity_residual_mps=free_left_endpoint_velocity_residual_mps,
+        free_right_endpoint_velocity_residual_mps=free_right_endpoint_velocity_residual_mps,
+        free_momentum_residual_per_linear_density_m2_s=(
+            free_momentum_residual_per_linear_density_m2_s
+        ),
+        last_cell_kinetic_energy_per_linear_density_m3_s2=(
+            cell_kinetic_energy_per_linear_density_m3_s2
+        ),
+        last_free_kinetic_energy_per_linear_density_m3_s2=(
+            free_kinetic_energy_per_linear_density_m3_s2
+        ),
+        last_resolved_kinetic_energy_per_linear_density_m3_s2=(
+            resolved_kinetic_energy_per_linear_density_m3_s2
+        ),
+        last_delta_free_per_linear_density_m3_s2=delta_free,
+        last_delta_constraint_per_linear_density_m3_s2=delta_constraint,
+        last_delta_total_per_linear_density_m3_s2=delta,
+        last_left_endpoint_material_velocity_mps=left_endpoint_material_velocity_mps,
+        last_right_endpoint_material_velocity_mps=right_endpoint_material_velocity_mps,
+        last_target_momentum_per_linear_density_m2_s=(
+            target_momentum_per_linear_density_m2_s
+        ),
+    )
+    return replace(
+        state,
+        material_remap_energy_error_per_linear_density_m3_s2=delta,
+        material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2=(
+            delta_constraint
+        ),
+        material_remap_energy_error_cumulative_per_linear_density_m3_s2=(
+            math.fsum((
+                state.material_remap_energy_error_cumulative_per_linear_density_m3_s2,
+                delta,
+            ))
+        ),
+        material_remap_event_count_cumulative=state.material_remap_event_count_cumulative + 1,
+        material_remap_energy_positive_cumulative_per_linear_density_m3_s2=(
+            math.fsum((
+                state.material_remap_energy_positive_cumulative_per_linear_density_m3_s2,
+                max(delta, 0.0),
+            ))
+        ),
+        material_remap_energy_negative_cumulative_per_linear_density_m3_s2=(
+            math.fsum((
+                state.material_remap_energy_negative_cumulative_per_linear_density_m3_s2,
+                min(delta, 0.0),
+            ))
+        ),
+        material_remap_energy_absolute_cumulative_per_linear_density_m3_s2=(
+            math.fsum((
+                state.material_remap_energy_absolute_cumulative_per_linear_density_m3_s2,
+                abs(delta),
+            ))
+        ),
+        uniform_ale_remap_decomposition=audit,
+    )
 
 
 @dataclass(frozen=True)
@@ -988,12 +2099,6 @@ def initialize_known_plough_runtime(dynamic_case) -> KnownPloughRuntime:
     )
     cable = cable_parameters_from_dynamic_case(dynamic_case)
     state = _initial_known_plough_state(dynamic_case, cable)
-    _feasible_bend_projection_radius_m(
-        requested_radius_m=cable.min_bending_radius_m,
-        rest_lengths_m=state.rest_lengths_m,
-        top_position=state.positions[0],
-        bottom_position=state.positions[-1],
-    )
     bend_radius = _minimum_bend_radius_diagnostic(
         state.positions,
         exclude_tail_nodes=_KNOWN_PLOUGH_RMIN_EXCLUDED_TAIL_NODES,
@@ -2023,20 +3128,11 @@ def _step_known_plough_dynamic(
     else:
         material_state = _rezone_known_plough_uniform_ale(
             state,
-            case=case,
             new_active_length_m=material_active_length,
             element_count=configured_element_count,
             payout_increment_m=payout_increment,
             laydown_increment_m=laydown_increment,
             dt_s=dt_s,
-            fairlead_prescribed_acceleration=_vessel_acceleration_vector(
-                dynamic_case,
-                next_time,
-            ),
-            plough_prescribed_acceleration=_plough_acceleration(
-                dynamic_case,
-                next_time,
-            ),
         )
     material_active_length = sum(material_state.rest_lengths_m)
     geometric_length_deficit = max(0.0, _norm(_sub(plough, vessel)) - material_active_length)
@@ -2067,8 +3163,40 @@ def _step_known_plough_dynamic(
         material_remap_energy_error_cumulative_per_linear_density_m3_s2=(
             material_state.material_remap_energy_error_cumulative_per_linear_density_m3_s2
         ),
+        material_remap_event_count_cumulative=material_state.material_remap_event_count_cumulative,
+        material_remap_energy_positive_cumulative_per_linear_density_m3_s2=(
+            material_state.material_remap_energy_positive_cumulative_per_linear_density_m3_s2
+        ),
+        material_remap_energy_negative_cumulative_per_linear_density_m3_s2=(
+            material_state.material_remap_energy_negative_cumulative_per_linear_density_m3_s2
+        ),
+        material_remap_energy_absolute_cumulative_per_linear_density_m3_s2=(
+            material_state.material_remap_energy_absolute_cumulative_per_linear_density_m3_s2
+        ),
+        uniform_ale_remap_decomposition=material_state.uniform_ale_remap_decomposition,
         material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2=(
             material_state.material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2
+        ),
+        tail_remesh_event_count=material_state.tail_remesh_event_count,
+        tail_remesh_event_count_cumulative=material_state.tail_remesh_event_count_cumulative,
+        tail_remesh_selected_window_segments=material_state.tail_remesh_selected_window_segments,
+        tail_remesh_max_window_segments=material_state.tail_remesh_max_window_segments,
+        tail_remesh_velocity_fidelity=material_state.tail_remesh_velocity_fidelity,
+        tail_remesh_min_velocity_fidelity=material_state.tail_remesh_min_velocity_fidelity,
+        tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2
         ),
     )
     # 轴向张力由 XPBD 恢复，因此显式预测器排除该项，避免重复施加同一内力。
@@ -2160,8 +3288,40 @@ def _step_known_plough_dynamic(
         material_remap_energy_error_cumulative_per_linear_density_m3_s2=(
             material_state.material_remap_energy_error_cumulative_per_linear_density_m3_s2
         ),
+        material_remap_event_count_cumulative=material_state.material_remap_event_count_cumulative,
+        material_remap_energy_positive_cumulative_per_linear_density_m3_s2=(
+            material_state.material_remap_energy_positive_cumulative_per_linear_density_m3_s2
+        ),
+        material_remap_energy_negative_cumulative_per_linear_density_m3_s2=(
+            material_state.material_remap_energy_negative_cumulative_per_linear_density_m3_s2
+        ),
+        material_remap_energy_absolute_cumulative_per_linear_density_m3_s2=(
+            material_state.material_remap_energy_absolute_cumulative_per_linear_density_m3_s2
+        ),
+        uniform_ale_remap_decomposition=material_state.uniform_ale_remap_decomposition,
         material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2=(
             material_state.material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2
+        ),
+        tail_remesh_event_count=material_state.tail_remesh_event_count,
+        tail_remesh_event_count_cumulative=material_state.tail_remesh_event_count_cumulative,
+        tail_remesh_selected_window_segments=material_state.tail_remesh_selected_window_segments,
+        tail_remesh_max_window_segments=material_state.tail_remesh_max_window_segments,
+        tail_remesh_velocity_fidelity=material_state.tail_remesh_velocity_fidelity,
+        tail_remesh_min_velocity_fidelity=material_state.tail_remesh_min_velocity_fidelity,
+        tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2
         ),
     )
     _, constrained_velocities = _apply_contact_friction(
@@ -2224,8 +3384,40 @@ def _step_known_plough_dynamic(
         material_remap_energy_error_cumulative_per_linear_density_m3_s2=(
             material_state.material_remap_energy_error_cumulative_per_linear_density_m3_s2
         ),
+        material_remap_event_count_cumulative=material_state.material_remap_event_count_cumulative,
+        material_remap_energy_positive_cumulative_per_linear_density_m3_s2=(
+            material_state.material_remap_energy_positive_cumulative_per_linear_density_m3_s2
+        ),
+        material_remap_energy_negative_cumulative_per_linear_density_m3_s2=(
+            material_state.material_remap_energy_negative_cumulative_per_linear_density_m3_s2
+        ),
+        material_remap_energy_absolute_cumulative_per_linear_density_m3_s2=(
+            material_state.material_remap_energy_absolute_cumulative_per_linear_density_m3_s2
+        ),
+        uniform_ale_remap_decomposition=material_state.uniform_ale_remap_decomposition,
         material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2=(
             material_state.material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2
+        ),
+        tail_remesh_event_count=material_state.tail_remesh_event_count,
+        tail_remesh_event_count_cumulative=material_state.tail_remesh_event_count_cumulative,
+        tail_remesh_selected_window_segments=material_state.tail_remesh_selected_window_segments,
+        tail_remesh_max_window_segments=material_state.tail_remesh_max_window_segments,
+        tail_remesh_velocity_fidelity=material_state.tail_remesh_velocity_fidelity,
+        tail_remesh_min_velocity_fidelity=material_state.tail_remesh_min_velocity_fidelity,
+        tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2
+        ),
+        tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2=(
+            material_state.tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2
         ),
     )
     next_payout_speed = _payout_speed(dynamic_case, next_time)
@@ -2279,13 +3471,21 @@ def _solve_xpbd_endpoint_constraints(
         )
     ]
     contact_lambdas = [0.0 for _ in solved]
+    bending_lambdas = [0.0 for _ in range(max(0, len(solved) - 2))]
+    if case.cable.bending_stiffness_n_m2 > 0.0:
+        bending_compliances_scaled = tuple(
+            (
+                0.5 * (rest_lengths_m[index] + rest_lengths_m[index + 1])
+                / (case.cable.bending_stiffness_n_m2 * dt_s * dt_s)
+                if 0.5 * (rest_lengths_m[index] + rest_lengths_m[index + 1])
+                > _MIN_LENGTH
+                else 0.0
+            )
+            for index in range(max(0, len(rest_lengths_m) - 1))
+        )
+    else:
+        bending_compliances_scaled = ()
     axial_stiffness = max(case.cable.axial_stiffness_n, _MIN_MASS)
-    bend_projection_radius_m = _feasible_bend_projection_radius_m(
-        requested_radius_m=case.cable.min_bending_radius_m,
-        rest_lengths_m=rest_lengths_m,
-        top_position=top_position,
-        bottom_position=bottom_position,
-    )
     maximum_iterations = max(1, iterations)
     convergence_check_start = (
         maximum_iterations
@@ -2307,10 +3507,17 @@ def _solve_xpbd_endpoint_constraints(
         length_lambdas = list(axial_step.lambdas_n_s2)
         solved[0] = top_position
         solved[-1] = bottom_position
-        _apply_minimum_bend_radius_constraints(
+        _apply_discrete_bending_constraints(
             solved,
+            rest_lengths_m=rest_lengths_m,
             inverse_masses=inverse_masses,
-            minimum_radius_m=bend_projection_radius_m,
+            # 转角梯度位于局部法向平面，使用含法向附加质量的标量逆质量；
+            # 轴向约束仍采用上面的方向质量矩阵。
+            inverse_mass_matrices=None,
+            bending_stiffness_n_m2=case.cable.bending_stiffness_n_m2,
+            dt_s=dt_s,
+            lambdas_kg_m2=bending_lambdas,
+            compliances_scaled=bending_compliances_scaled,
         )
         solved[0] = top_position
         solved[-1] = bottom_position
@@ -2338,13 +3545,34 @@ def _solve_xpbd_endpoint_constraints(
                 axial_stiffness_n=axial_stiffness,
                 dt_s=dt_s,
             )
-            if axial_residual_m <= _KNOWN_PLOUGH_AXIAL_RESIDUAL_TOLERANCE_M:
+            bending_residual_rad = _bending_constraint_residual_rad(
+                solved,
+                rest_lengths_m=rest_lengths_m,
+                bending_stiffness_n_m2=case.cable.bending_stiffness_n_m2,
+                dt_s=dt_s,
+                lambdas_kg_m2=bending_lambdas,
+                compliances_scaled=bending_compliances_scaled,
+            )
+            if (
+                axial_residual_m <= _KNOWN_PLOUGH_AXIAL_RESIDUAL_TOLERANCE_M
+                and bending_residual_rad
+                <= _KNOWN_PLOUGH_BENDING_EQUILIBRIUM_RESIDUAL_TOLERANCE_RAD
+            ):
                 break
     if axial_residual_m > _KNOWN_PLOUGH_AXIAL_RESIDUAL_TOLERANCE_M:
         raise RuntimeError(
             "global axial constraints did not converge: "
             f"residual {axial_residual_m:.6g} m exceeds "
             f"{_KNOWN_PLOUGH_AXIAL_RESIDUAL_TOLERANCE_M:.6g} m"
+        )
+    if (
+        bending_residual_rad
+        > _KNOWN_PLOUGH_BENDING_EQUILIBRIUM_RESIDUAL_TOLERANCE_RAD
+    ):
+        raise RuntimeError(
+            "bending constraints did not converge: "
+            f"equilibrium residual {bending_residual_rad:.6g} rad exceeds "
+            f"{_KNOWN_PLOUGH_BENDING_EQUILIBRIUM_RESIDUAL_TOLERANCE_RAD:.6g} rad"
         )
     return (
         tuple(solved),
@@ -2355,81 +3583,247 @@ def _solve_xpbd_endpoint_constraints(
     )
 
 
-def _feasible_bend_projection_radius_m(
+def _bending_constraint_residual_rad(
+    positions: list[Vector3] | tuple[Vector3, ...],
     *,
-    requested_radius_m: float | None,
     rest_lengths_m: tuple[float, ...],
-    top_position: Vector3,
-    bottom_position: Vector3,
-) -> float | None:
-    """校验固定端点和活动弧长能否实现请求的最小弯曲半径。"""
+    bending_stiffness_n_m2: float,
+    dt_s: float,
+    lambdas_kg_m2: list[float] | tuple[float, ...],
+    compliances_scaled: tuple[float, ...] | None = None,
+) -> float:
+    """Return ``max|theta + alpha_tilde*lambda|`` after all projections.
 
-    if requested_radius_m is None:
-        return None
-    if not math.isfinite(requested_radius_m):
-        raise ValueError("requested minimum bend radius must be finite")
-    if requested_radius_m <= 0.0:
-        raise ValueError("requested minimum bend radius must be positive")
-    if requested_radius_m <= _MIN_LENGTH:
-        return requested_radius_m
-    arc_length_m = sum(rest_lengths_m)
-    chord_length_m = math.dist(top_position, bottom_position)
-    if arc_length_m <= chord_length_m + _MIN_LENGTH:
-        return requested_radius_m
-    chord_ratio = max(0.0, min(1.0, chord_length_m / arc_length_m))
-    lower_angle = 0.0
-    upper_angle = math.pi
-    for _ in range(80):
-        half_angle = 0.5 * (lower_angle + upper_angle)
-        ratio = math.sin(half_angle) / half_angle
-        if ratio > chord_ratio:
-            lower_angle = half_angle
-        else:
-            upper_angle = half_angle
-    equivalent_arc_radius_m = arc_length_m / (lower_angle + upper_angle)
-    if requested_radius_m > equivalent_arc_radius_m * (1.0 + 1.0e-12):
-        raise ValueError(
-            "requested minimum bend radius "
-            f"{requested_radius_m:.12g} m exceeds maximum feasible radius "
-            f"{equivalent_arc_radius_m:.12g} m for the fixed endpoints and active arc length"
+    ``theta`` is radians and ``alpha_tilde=l_bar/(EI*dt^2)`` has units
+    ``1/(kg*m^2)``.  The angle multiplier has units ``kg*m^2``, so the full
+    compliant-equilibrium residual is an angle in radians.  ``EI<=0`` is the
+    exact legacy path and has zero bending residual.
+    """
+
+    if bending_stiffness_n_m2 <= 0.0:
+        return 0.0
+    if dt_s <= 0.0:
+        raise ValueError("dt_s must be positive")
+    if len(rest_lengths_m) != len(positions) - 1:
+        raise ValueError("rest_lengths_m must contain one entry per segment")
+    if len(lambdas_kg_m2) != max(0, len(positions) - 2):
+        raise ValueError("bending lambdas must contain one entry per interior node")
+    if compliances_scaled is not None and len(compliances_scaled) != len(lambdas_kg_m2):
+        raise ValueError("bending compliances must contain one entry per interior node")
+    stiffness_time_scale = bending_stiffness_n_m2 * dt_s * dt_s
+    residual = 0.0
+    for node_index in range(1, len(positions) - 1):
+        previous = positions[node_index - 1]
+        current = positions[node_index]
+        following = positions[node_index + 1]
+        left_x = current[0] - previous[0]
+        left_y = current[1] - previous[1]
+        left_z = current[2] - previous[2]
+        right_x = following[0] - current[0]
+        right_y = following[1] - current[1]
+        right_z = following[2] - current[2]
+        left_length = math.sqrt(left_x * left_x + left_y * left_y + left_z * left_z)
+        right_length = math.sqrt(
+            right_x * right_x + right_y * right_y + right_z * right_z
         )
-    return requested_radius_m
+        if left_length <= _MIN_LENGTH or right_length <= _MIN_LENGTH:
+            return math.inf
+        cosine = max(
+            -1.0,
+            min(
+                1.0,
+                (left_x * right_x + left_y * right_y + left_z * right_z)
+                / (left_length * right_length),
+            ),
+        )
+        theta = math.acos(cosine)
+        if compliances_scaled is not None:
+            compliance_scaled = compliances_scaled[node_index - 1]
+        else:
+            mean_rest = 0.5 * (
+                rest_lengths_m[node_index - 1] + rest_lengths_m[node_index]
+            )
+            if mean_rest <= _MIN_LENGTH:
+                return math.inf
+            compliance_scaled = mean_rest / stiffness_time_scale
+        if compliance_scaled <= 0.0:
+            return math.inf
+        residual = max(
+            residual,
+            abs(theta + compliance_scaled * lambdas_kg_m2[node_index - 1]),
+        )
+    return residual
 
 
-def _apply_minimum_bend_radius_constraints(
+def _apply_discrete_bending_constraints(
     positions: list[Vector3],
     *,
+    rest_lengths_m: tuple[float, ...],
     inverse_masses: tuple[float, ...],
-    minimum_radius_m: float | None,
+    inverse_mass_matrices,
+    bending_stiffness_n_m2: float,
+    dt_s: float,
+    lambdas_kg_m2: list[float],
+    compliances_scaled: tuple[float, ...] | None = None,
 ) -> None:
-    """配置工程最小弯曲半径时减小局部折角。"""
+    """用相邻切向转角施加零自然曲率的离散 XPBD 弯曲能。
 
-    if minimum_radius_m is None or minimum_radius_m <= _MIN_LENGTH or len(positions) < 3:
+    对内部节点 ``i`` 定义 ``theta=acos(t_left dot t_right)``。以相邻参考段
+    平均长度 ``l_bar`` 离散 ``0.5*EI*integral(kappa^2 ds)``，得到
+    ``U_i=0.5*(EI/l_bar)*theta^2``。因此无量纲角度约束的刚度为
+    ``EI/l_bar [N*m]``，XPBD 缩放柔度为
+    ``alpha_tilde=l_bar/(EI*dt^2) [1/(kg*m^2)]``。
+
+    ``EI<=0`` 是严格兼容路径：不产生任何位置修正。端点由零逆质量和调用方
+    的强制回写共同保持不变；海床接触在本投影之后处理。
+    """
+
+    if bending_stiffness_n_m2 <= 0.0 or dt_s <= 0.0 or len(positions) < 3:
         return
-    for index in range(1, len(positions) - 1):
-        wi = inverse_masses[index]
-        if wi <= _MIN_MASS:
+    if len(rest_lengths_m) != len(positions) - 1:
+        raise ValueError("rest_lengths_m must contain one entry per segment")
+    if len(lambdas_kg_m2) != len(positions) - 2:
+        raise ValueError("bending lambdas must contain one entry per interior node")
+    if compliances_scaled is not None and len(compliances_scaled) != len(lambdas_kg_m2):
+        raise ValueError("bending compliances must contain one entry per interior node")
+
+    stiffness_time_scale = bending_stiffness_n_m2 * dt_s * dt_s
+    for node_index in range(1, len(positions) - 1):
+        if compliances_scaled is not None:
+            compliance_scaled = compliances_scaled[node_index - 1]
+        else:
+            mean_rest = 0.5 * (
+                rest_lengths_m[node_index - 1] + rest_lengths_m[node_index]
+            )
+            if mean_rest <= _MIN_LENGTH:
+                continue
+            compliance_scaled = mean_rest / stiffness_time_scale
+        if compliance_scaled <= 0.0:
             continue
-        previous = positions[index - 1]
-        current = positions[index]
-        next_point = positions[index + 1]
-        first = _sub(current, previous)
-        second = _sub(next_point, current)
-        first_length = _norm(first)
-        second_length = _norm(second)
-        if first_length <= _MIN_LENGTH or second_length <= _MIN_LENGTH:
+        previous = positions[node_index - 1]
+        current = positions[node_index]
+        following = positions[node_index + 1]
+        left_x = current[0] - previous[0]
+        left_y = current[1] - previous[1]
+        left_z = current[2] - previous[2]
+        right_x = following[0] - current[0]
+        right_y = following[1] - current[1]
+        right_z = following[2] - current[2]
+        left_length = math.sqrt(left_x * left_x + left_y * left_y + left_z * left_z)
+        right_length = math.sqrt(
+            right_x * right_x + right_y * right_y + right_z * right_z
+        )
+        if left_length <= _MIN_LENGTH or right_length <= _MIN_LENGTH:
             continue
-        dot = max(-1.0, min(1.0, _dot(first, second) / (first_length * second_length)))
-        turn = math.acos(dot)
-        max_turn = 0.5 * (first_length + second_length) / minimum_radius_m
-        if turn <= max_turn:
+        inverse_left_length = 1.0 / left_length
+        inverse_right_length = 1.0 / right_length
+        left_tangent = (
+            left_x * inverse_left_length,
+            left_y * inverse_left_length,
+            left_z * inverse_left_length,
+        )
+        right_tangent = (
+            right_x * inverse_right_length,
+            right_y * inverse_right_length,
+            right_z * inverse_right_length,
+        )
+        cosine = max(
+            -1.0,
+            min(
+                1.0,
+                left_tangent[0] * right_tangent[0]
+                + left_tangent[1] * right_tangent[1]
+                + left_tangent[2] * right_tangent[2],
+            ),
+        )
+        constraint = math.acos(cosine)
+        sine = math.sqrt(max(0.0, 1.0 - cosine * cosine))
+        if constraint <= 1.0e-12:
             continue
-        chord = _sub(next_point, previous)
-        chord_length2 = max(_dot(chord, chord), _MIN_LENGTH)
-        fraction = max(0.0, min(1.0, _dot(_sub(current, previous), chord) / chord_length2))
-        foot = _add(previous, _mul(chord, fraction))
-        relaxation = min(0.65, max(0.05, (turn - max_turn) / max(turn, _MIN_LENGTH)))
-        positions[index] = _add(current, _mul(_sub(foot, current), relaxation))
+        if sine <= 1.0e-10:
+            # 在 180° 共线折返处，acos 梯度没有唯一方向；选择确定性的横向
+            # 次梯度使两段向同一侧展开，避免把最大曲率节点静默跳过。
+            transverse = _stable_transverse_direction(left_tangent)
+            left_gradient = _mul(transverse, 1.0 / left_length)
+            right_gradient = _mul(transverse, -1.0 / right_length)
+        else:
+            left_gradient = _mul(
+                _sub(right_tangent, _mul(left_tangent, cosine)),
+                1.0 / (left_length * sine),
+            )
+            right_gradient = _mul(
+                _sub(_mul(right_tangent, cosine), left_tangent),
+                1.0 / (right_length * sine),
+            )
+        gradients = (
+            left_gradient,
+            _mul(_add(left_gradient, right_gradient), -1.0),
+            right_gradient,
+        )
+        if inverse_mass_matrices is None:
+            weighted_gradients = (
+                _mul(gradients[0], inverse_masses[node_index - 1]),
+                _mul(gradients[1], inverse_masses[node_index]),
+                _mul(gradients[2], inverse_masses[node_index + 1]),
+            )
+        else:
+            weighted_gradients = tuple(
+                _inverse_mass_times_vector(
+                    inverse_mass_matrices,
+                    inverse_masses,
+                    node_index + offset - 1,
+                    gradient,
+                )
+                for offset, gradient in enumerate(gradients)
+            )
+        weighted_gradient_norms = tuple(
+            gradient[0] * weighted[0]
+            + gradient[1] * weighted[1]
+            + gradient[2] * weighted[2]
+            for gradient, weighted in zip(gradients, weighted_gradients)
+        )
+        denominator = compliance_scaled + sum(weighted_gradient_norms)
+        if denominator <= _MIN_MASS:
+            continue
+        lambda_value = lambdas_kg_m2[node_index - 1]
+        delta_lambda = (
+            -constraint - compliance_scaled * lambda_value
+        ) / denominator
+        raw_correction_max = max(
+            math.sqrt(
+                (weighted[0] * delta_lambda) ** 2
+                + (weighted[1] * delta_lambda) ** 2
+                + (weighted[2] * delta_lambda) ** 2
+            )
+            for weighted in weighted_gradients
+        )
+        correction_limit = 0.25 * min(left_length, right_length)
+        if raw_correction_max > correction_limit > 0.0:
+            delta_lambda *= correction_limit / raw_correction_max
+        lambdas_kg_m2[node_index - 1] += delta_lambda
+        for offset, weighted in enumerate(weighted_gradients):
+            position_index = node_index + offset - 1
+            position = positions[position_index]
+            positions[position_index] = (
+                position[0] + weighted[0] * delta_lambda,
+                position[1] + weighted[1] * delta_lambda,
+                position[2] + weighted[2] * delta_lambda,
+            )
+
+
+def _inverse_mass_times_vector(
+    inverse_mass_matrices,
+    inverse_masses: tuple[float, ...],
+    index: int,
+    vector: Vector3,
+) -> Vector3:
+    if inverse_mass_matrices is None:
+        return _mul(vector, inverse_masses[index])
+    matrix = inverse_mass_matrices[index]
+    return tuple(
+        sum(matrix[row][column] * vector[column] for column in range(3))
+        for row in range(3)
+    )  # type: ignore[return-value]
 
 
 def _apply_segment_spacing_floor_constraints(
@@ -3224,14 +4618,11 @@ def _advance_known_plough_material_control_volume(
 def _rezone_known_plough_uniform_ale(
     state: DynamicLayingState,
     *,
-    case: StepConditions,
     new_active_length_m: float,
     element_count: int,
     payout_increment_m: float,
     laydown_increment_m: float,
     dt_s: float,
-    fairlead_prescribed_acceleration: Vector3 = (0.0, 0.0, 0.0),
-    plough_prescribed_acceleration: Vector3 = (0.0, 0.0, 0.0),
 ) -> DynamicLayingState:
     """将悬空的已知犁轨迹跨段保守重分区为均匀 ALE 单元。
 
@@ -3276,6 +4667,10 @@ def _rezone_known_plough_uniform_ale(
             state,
             material_remap_energy_error_per_linear_density_m3_s2=0.0,
             material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2=0.0,
+            tail_remesh_event_count=0,
+            tail_remesh_selected_window_segments=0,
+            tail_remesh_velocity_fidelity=1.0,
+            tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2=0.0,
         )
 
     fairlead_speed = increments[0] / dt_s
@@ -3405,6 +4800,16 @@ def _rezone_known_plough_uniform_ale(
         l2_rhs,
         target_rest_lengths,
     )
+    free_left_endpoint_velocity_residual = _sub(
+        free_projection[0], endpoint_material_velocities[0]
+    )
+    free_right_endpoint_velocity_residual = _sub(
+        free_projection[-1], endpoint_material_velocities[1]
+    )
+    free_momentum = _consistent_linear_material_momentum(
+        list(free_projection), list(target_rest_lengths)
+    )
+    free_momentum_residual = _sub(free_momentum, cell_momentum)
     resolved_momentum = _consistent_linear_material_momentum(
         list(material_velocities),
         list(target_rest_lengths),
@@ -3441,13 +4846,25 @@ def _rezone_known_plough_uniform_ale(
             ],
         )
     )
+    source_rest_lengths = tuple(
+        right - left
+        for left, right in zip(source_coordinates, source_coordinates[1:])
+    )
+    source_momentum = _consistent_linear_material_momentum(
+        list(source_material_velocities), list(source_rest_lengths)
+    )
+    source_momentum_residual = _norm(_sub(source_momentum, cell_momentum))
+    source_momentum_tolerance = 64.0 * math.ulp(max(
+        _norm(source_momentum), _norm(cell_momentum), 1.0
+    ))
+    source_energy_residual = abs(source_kinetic_energy - cell_kinetic_energy)
     source_energy_tolerance = _kinetic_energy_roundoff_tolerance(
         cell_kinetic_energy,
         source_kinetic_energy,
         old_node_count=len(state.positions),
         new_node_count=len(source_material_velocities),
     )
-    if abs(source_kinetic_energy - cell_kinetic_energy) > source_energy_tolerance:
+    if source_energy_residual > source_energy_tolerance:
         raise RuntimeError("uniform ALE source P1 field and transported K disagree")
     energy_tolerance = _kinetic_energy_roundoff_tolerance(
         cell_kinetic_energy,
@@ -3469,6 +4886,26 @@ def _rezone_known_plough_uniform_ale(
     remap_energy_error = resolved_kinetic_energy - cell_kinetic_energy
     constraint_projection_numerical_energy_increment = (
         resolved_kinetic_energy - free_projection_energy
+    )
+    free_projection_energy_error = free_projection_energy - cell_kinetic_energy
+    _observe_uniform_ale_shadow(
+        event_count_cumulative=state.material_remap_event_count_cumulative + 1,
+        rest_lengths_m=target_rest_lengths,
+        active_length_m=new_active_length_m,
+        payout_increment_m=increments[0],
+        laydown_increment_m=increments[1],
+        free_velocities=free_projection,
+        closest_velocities=material_velocities,
+        left_endpoint_velocity_mps=endpoint_material_velocities[0],
+        right_endpoint_velocity_mps=endpoint_material_velocities[1],
+        target_momentum_per_linear_density_m2_s=cell_momentum,
+        k_cell_per_linear_density_m3_s2=cell_kinetic_energy,
+        k_free_per_linear_density_m3_s2=free_projection_energy,
+        k_closest_per_linear_density_m3_s2=resolved_kinetic_energy,
+        source_p1_momentum_residual_per_linear_density_m2_s=source_momentum_residual,
+        source_p1_momentum_tolerance_per_linear_density_m2_s=source_momentum_tolerance,
+        source_p1_energy_residual_per_linear_density_m3_s2=source_energy_residual,
+        source_p1_energy_tolerance_per_linear_density_m3_s2=source_energy_tolerance,
     )
     rezoned_cells: list[_MaterialCellIntegral] = []
     for cell, left_velocity, right_velocity in zip(
@@ -3525,14 +4962,30 @@ def _rezone_known_plough_uniform_ale(
         material_suspended_length_m=new_active_length_m,
         known_plough_material_control_volume=transported_control,
         geometric_length_deficit_m=max(0.0, endpoint_span - new_active_length_m),
-        material_remap_energy_error_per_linear_density_m3_s2=remap_energy_error,
-        material_remap_energy_error_cumulative_per_linear_density_m3_s2=(
-            state.material_remap_energy_error_cumulative_per_linear_density_m3_s2
-            + remap_energy_error
-        ),
         material_remap_constraint_projection_numerical_energy_increment_per_linear_density_m3_s2=(
             constraint_projection_numerical_energy_increment
         ),
+        tail_remesh_event_count=0,
+        tail_remesh_selected_window_segments=0,
+        tail_remesh_velocity_fidelity=1.0,
+        tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2=0.0,
+    )
+    remapped_state = _accumulate_uniform_ale_energy_audit(
+        remapped_state,
+        delta_free_per_linear_density_m3_s2=free_projection_energy_error,
+        delta_constraint_per_linear_density_m3_s2=(
+            constraint_projection_numerical_energy_increment
+        ),
+        delta_total_per_linear_density_m3_s2=remap_energy_error,
+        free_left_endpoint_velocity_residual_mps=free_left_endpoint_velocity_residual,
+        free_right_endpoint_velocity_residual_mps=free_right_endpoint_velocity_residual,
+        free_momentum_residual_per_linear_density_m2_s=free_momentum_residual,
+        cell_kinetic_energy_per_linear_density_m3_s2=cell_kinetic_energy,
+        free_kinetic_energy_per_linear_density_m3_s2=free_projection_energy,
+        resolved_kinetic_energy_per_linear_density_m3_s2=resolved_kinetic_energy,
+        left_endpoint_material_velocity_mps=endpoint_material_velocities[0],
+        right_endpoint_material_velocity_mps=endpoint_material_velocities[1],
+        target_momentum_per_linear_density_m2_s=cell_momentum,
     )
     _validate_state(remapped_state)
     return remapped_state
@@ -3557,7 +5010,14 @@ def _advance_known_plough_material_flow(
     payout_increment = max(0.0, payout_increment_m)
     laydown_increment = max(0.0, laydown_increment_m)
     net_increment = payout_increment - laydown_increment
-    geometry_seed = replace(state, known_plough_material_control_volume=None)
+    geometry_seed = replace(
+        state,
+        known_plough_material_control_volume=None,
+        tail_remesh_event_count=0,
+        tail_remesh_selected_window_segments=0,
+        tail_remesh_velocity_fidelity=1.0,
+        tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2=0.0,
+    )
     if abs(net_increment) <= _MIN_LENGTH:
         geometry_state = geometry_seed
     elif net_increment > 0.0:
@@ -3630,6 +5090,25 @@ def _withdraw_known_plough_tail_length(
     contact_reactions = list(_state_physical_contact_reactions(state))
     length_lambdas = [reaction * dt_s * dt_s for reaction in length_reactions]
     contact_lambdas = [reaction * dt_s * dt_s for reaction in contact_reactions]
+    event_count = state.tail_remesh_event_count
+    event_count_cumulative = state.tail_remesh_event_count_cumulative
+    selected_window = state.tail_remesh_selected_window_segments
+    maximum_window = state.tail_remesh_max_window_segments
+    velocity_fidelity = state.tail_remesh_velocity_fidelity
+    minimum_velocity_fidelity = state.tail_remesh_min_velocity_fidelity
+    energy_delta = state.tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2
+    energy_delta_cumulative = (
+        state.tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2
+    )
+    energy_positive_cumulative = (
+        state.tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2
+    )
+    energy_negative_cumulative = (
+        state.tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2
+    )
+    energy_absolute_cumulative = (
+        state.tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2
+    )
     remaining = laydown_increment_m
     min_length = max(_MIN_LENGTH, minimum_segment_length_m)
     while remaining > _MIN_LENGTH and rest_lengths:
@@ -3653,7 +5132,7 @@ def _withdraw_known_plough_tail_length(
             break
         rest_lengths[-1] -= length_to_remesh
         remaining = max(0.0, remaining - length_to_remesh)
-        remeshed = _remesh_known_plough_tail_window(
+        remesh_result = _remesh_known_plough_tail_window(
             positions=positions,
             velocities=velocities,
             rest_lengths_m=rest_lengths,
@@ -3666,7 +5145,7 @@ def _withdraw_known_plough_tail_length(
             dt_s=dt_s,
             seabed_depth_m=seabed_depth_m,
         )
-        if remeshed is None:
+        if remesh_result is None:
             raise RuntimeError(
                 "known-plough tail remesh projection failed; refusing to advance a sub-grid segment"
             )
@@ -3680,29 +5159,65 @@ def _withdraw_known_plough_tail_length(
             length_reactions,
             contact_lambdas,
             contact_reactions,
-        ) = remeshed
+        ) = remesh_result.remeshed
+        event_count += 1
+        event_count_cumulative += 1
+        selected_window = remesh_result.selected_window_segments
+        maximum_window = max(maximum_window, selected_window)
+        velocity_fidelity = remesh_result.velocity_fidelity
+        minimum_velocity_fidelity = min(minimum_velocity_fidelity, velocity_fidelity)
+        energy_delta = math.fsum((
+            energy_delta,
+            remesh_result.lumped_kinetic_energy_delta_per_linear_density_m3_s2,
+        ))
+        energy_delta_cumulative = math.fsum((
+            energy_delta_cumulative,
+            remesh_result.lumped_kinetic_energy_delta_per_linear_density_m3_s2,
+        ))
+        energy_positive_cumulative = math.fsum((
+            energy_positive_cumulative,
+            max(remesh_result.lumped_kinetic_energy_delta_per_linear_density_m3_s2, 0.0),
+        ))
+        energy_negative_cumulative = math.fsum((
+            energy_negative_cumulative,
+            min(remesh_result.lumped_kinetic_energy_delta_per_linear_density_m3_s2, 0.0),
+        ))
+        energy_absolute_cumulative = math.fsum((
+            energy_absolute_cumulative,
+            abs(remesh_result.lumped_kinetic_energy_delta_per_linear_density_m3_s2),
+        ))
         if remaining <= _MIN_LENGTH:
             break
-    return DynamicLayingState(
-        time_s=state.time_s,
+    return replace(
+        state,
         positions=tuple(positions),
         velocities=tuple(velocities),
         rest_lengths_m=tuple(rest_lengths),
-        paid_length_m=state.paid_length_m,
-        laid_length_m=state.laid_length_m,
         contact_flags=tuple(contact_flags),
         length_lambdas_n_s2=tuple(length_lambdas[: len(rest_lengths)]),
         contact_lambdas_n_s2=tuple(contact_lambdas[: len(positions)]),
         segment_tensions_n=tuple(segment_tensions[: len(rest_lengths)]),
         length_constraint_reactions_n=tuple(length_reactions[: len(rest_lengths)]),
         contact_normal_reactions_n=tuple(contact_reactions[: len(positions)]),
-        payout_buffer_m=state.payout_buffer_m,
-        laydown_buffer_m=state.laydown_buffer_m,
-        laid_segment_lengths_m=state.laid_segment_lengths_m,
-        material_suspended_length_m=state.material_suspended_length_m,
-        geometric_length_deficit_m=state.geometric_length_deficit_m,
-        axial_solve_iterations=state.axial_solve_iterations,
-        axial_constraint_residual_m=state.axial_constraint_residual_m,
+        tail_remesh_event_count=event_count,
+        tail_remesh_event_count_cumulative=event_count_cumulative,
+        tail_remesh_selected_window_segments=selected_window,
+        tail_remesh_max_window_segments=maximum_window,
+        tail_remesh_velocity_fidelity=velocity_fidelity,
+        tail_remesh_min_velocity_fidelity=minimum_velocity_fidelity,
+        tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2=energy_delta,
+        tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2=(
+            energy_delta_cumulative
+        ),
+        tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2=(
+            energy_positive_cumulative
+        ),
+        tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2=(
+            energy_negative_cumulative
+        ),
+        tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2=(
+            energy_absolute_cumulative
+        ),
     )
 
 
@@ -3719,24 +5234,22 @@ def _remesh_known_plough_tail_window(
     contact_normal_reactions_n: list[float],
     dt_s: float,
     seabed_depth_m: float | None = None,
-) -> tuple[
-    list[Vector3],
-    list[Vector3],
-    list[float],
-    list[bool],
-    list[float],
-    list[float],
-    list[float],
-    list[float],
-    list[float],
-] | None:
+    max_window_segment_count: int = _MAX_LOCAL_TAIL_REMESH_WINDOW_SEGMENTS,
+) -> _TailRemeshResult | None:
     """通过守恒材料状态投影移除一个尾部节点。"""
 
     if dt_s <= 0.0:
         raise ValueError("dt_s must be positive")
-    # 优先选择最小守恒窗口；海床接触几何或动能门限可能需要增加一个内部自由度。
-    for window_segment_count in range(3, min(4, len(rest_lengths_m)) + 1):
-        remeshed = _remesh_known_plough_tail_window_with_count(
+    if max_window_segment_count < 3:
+        raise ValueError("max_window_segment_count must be at least 3")
+    # 优先选择最小守恒窗口；若小窗口不相容，逐段扩大，但不突破本版本明确的
+    # 局部性策略，也不允许把全链作为尾部重网格窗口。
+    maximum_window = min(
+        max_window_segment_count,
+        len(rest_lengths_m) - 1,
+    )
+    for window_segment_count in range(3, maximum_window + 1):
+        result = _remesh_known_plough_tail_window_with_count(
             positions=positions,
             velocities=velocities,
             rest_lengths_m=rest_lengths_m,
@@ -3750,8 +5263,9 @@ def _remesh_known_plough_tail_window(
             window_segment_count=window_segment_count,
             seabed_depth_m=seabed_depth_m,
         )
-        if remeshed is None:
+        if result is None:
             continue
+        remeshed = result.remeshed
         start_segment = len(rest_lengths_m) - window_segment_count
         try:
             old_energy = _lumped_structural_kinetic_energy_per_linear_density(
@@ -3782,7 +5296,12 @@ def _remesh_known_plough_tail_window(
             continue
         energy_increase = new_energy - old_energy
         if math.isfinite(energy_increase) and energy_increase <= tolerance:
-            return remeshed
+            if abs(
+                energy_increase
+                - result.lumped_kinetic_energy_delta_per_linear_density_m3_s2
+            ) > tolerance:
+                continue
+            return result
     return None
 
 
@@ -3800,17 +5319,7 @@ def _remesh_known_plough_tail_window_with_count(
     dt_s: float,
     window_segment_count: int,
     seabed_depth_m: float | None,
-) -> tuple[
-    list[Vector3],
-    list[Vector3],
-    list[float],
-    list[bool],
-    list[float],
-    list[float],
-    list[float],
-    list[float],
-    list[float],
-] | None:
+) -> _TailRemeshResult | None:
     """在保持长度和积分场的条件下粗化尾部窗口。
 
     节点位置投影到重映射后的变形长度；P1 速度采用守恒传递；XPBD 乘子先转换为
@@ -3867,13 +5376,28 @@ def _remesh_known_plough_tail_window_with_count(
         )
         if seabed_projected_positions is None:
             return None
+        seabed_projected_positions[0] = projected_positions[0]
+        seabed_projected_positions[-1] = projected_positions[-1]
+        if any(
+            abs(_norm(_sub(right, left)) - target)
+            > _segment_length_backward_error_tolerance(left, right, target)
+            for left, right, target in zip(
+                seabed_projected_positions,
+                seabed_projected_positions[1:],
+                target_deformed_lengths,
+            )
+        ):
+            return None
         projected_positions = seabed_projected_positions
 
-    projected_velocities = _conservative_material_velocity_transfer(
+    velocity_transfer = _nonincreasing_conservative_material_velocity_transfer(
         old_velocities=old_velocities,
         old_rest_lengths=old_rest_lengths,
         new_rest_lengths=new_rest_lengths,
     )
+    if velocity_transfer is None:
+        return None
+    projected_velocities = velocity_transfer.velocities
     sampled_contact_reactions = [
         _sample_material_scalar(old_contact_reactions, old_coordinates, coordinate)
         for coordinate in new_coordinates
@@ -3902,22 +5426,26 @@ def _remesh_known_plough_tail_window_with_count(
     remapped_tensions = remap_segment_energy_field(segment_tensions_n)
     remapped_reactions = remap_segment_energy_field(length_constraint_reactions_n)
 
-    return (
-        positions[:start_segment] + projected_positions,
-        velocities[:start_segment] + projected_velocities,
-        rest_lengths_m[:start_segment] + new_rest_lengths,
-        contact_flags[:start_segment] + sampled_contact_flags,
-        [
-            reaction * dt_s * dt_s
-            for reaction in length_constraint_reactions_n[:start_segment] + remapped_reactions
-        ],
-        segment_tensions_n[:start_segment] + remapped_tensions,
-        length_constraint_reactions_n[:start_segment] + remapped_reactions,
-        [
-            reaction * dt_s * dt_s
-            for reaction in contact_normal_reactions_n[:start_segment] + sampled_contact_reactions
-        ],
-        contact_normal_reactions_n[:start_segment] + sampled_contact_reactions,
+    return _TailRemeshResult(
+        remeshed=(
+            positions[:start_segment] + projected_positions,
+            velocities[:start_segment] + projected_velocities,
+            rest_lengths_m[:start_segment] + new_rest_lengths,
+            contact_flags[:start_segment] + sampled_contact_flags,
+            length_lambdas_n_s2[:start_segment]
+            + [reaction * dt_s * dt_s for reaction in remapped_reactions],
+            segment_tensions_n[:start_segment] + remapped_tensions,
+            length_constraint_reactions_n[:start_segment] + remapped_reactions,
+            contact_lambdas_n_s2[:start_segment]
+            + [reaction * dt_s * dt_s for reaction in sampled_contact_reactions],
+            contact_normal_reactions_n[:start_segment] + sampled_contact_reactions,
+        ),
+        selected_window_segments=window_segment_count,
+        velocity_fidelity=velocity_transfer.fidelity,
+        lumped_kinetic_energy_delta_per_linear_density_m3_s2=(
+            velocity_transfer.new_lumped_kinetic_energy_per_linear_density_m3_s2
+            - velocity_transfer.old_lumped_kinetic_energy_per_linear_density_m3_s2
+        ),
     )
 
 
@@ -4140,6 +5668,9 @@ def _conservative_material_velocity_transfer(
         _sample_material_vector(old_velocities, old_coordinates, coordinate)
         for coordinate in new_coordinates
     ]
+    # 材料坐标采样会在端点产生最后几位舍入；在任何动量闭合前恢复强制端点。
+    projected[0] = old_velocities[0]
+    projected[-1] = old_velocities[-1]
     old_momentum = _lumped_material_momentum(old_velocities, old_rest_lengths)
     new_momentum = _lumped_material_momentum(projected, new_rest_lengths)
     new_tributaries = _node_tributary_lengths(new_rest_lengths)
@@ -4155,6 +5686,158 @@ def _conservative_material_velocity_transfer(
     for index in range(1, len(projected) - 1):
         projected[index] = _add(projected[index], correction)
     return projected
+
+
+def _nonincreasing_conservative_material_velocity_transfer(
+    *,
+    old_velocities: list[Vector3],
+    old_rest_lengths: list[float],
+    new_rest_lengths: list[float],
+) -> _VelocityTransferResult | None:
+    """在固定端点和动量守恒下保留尽可能多的粗化前速度结构。
+
+    首先构造现有的质量加权最近场。若该场会产生超过舍入误差的正动能，计算同一
+    仿射可行集内的最小动能场；只有该最小值不高于旧动能时窗口才可粗化。随后沿
+    最小动能场到最近场的线段二分最大保真参数，使最终场继续满足原非增能门。
+    """
+
+    closest = _conservative_material_velocity_transfer(
+        old_velocities=old_velocities,
+        old_rest_lengths=old_rest_lengths,
+        new_rest_lengths=new_rest_lengths,
+    )
+    old_energy = _lumped_structural_kinetic_energy_per_linear_density(
+        old_velocities,
+        old_rest_lengths,
+    )
+    closest_energy = _lumped_structural_kinetic_energy_per_linear_density(
+        closest,
+        new_rest_lengths,
+    )
+
+    def validated_result(
+        velocities: list[Vector3],
+        *,
+        fidelity: float,
+    ) -> _VelocityTransferResult | None:
+        if velocities[0] != old_velocities[0] or velocities[-1] != old_velocities[-1]:
+            return None
+        old_momentum = _lumped_material_momentum(old_velocities, old_rest_lengths)
+        new_momentum = _lumped_material_momentum(velocities, new_rest_lengths)
+        momentum_tolerance = _momentum_roundoff_tolerance(
+            old_momentum,
+            new_momentum,
+            old_node_count=len(old_velocities),
+            new_node_count=len(velocities),
+        )
+        if _norm(_sub(new_momentum, old_momentum)) > momentum_tolerance:
+            return None
+        new_energy = _lumped_structural_kinetic_energy_per_linear_density(
+            velocities,
+            new_rest_lengths,
+        )
+        energy_tolerance = _kinetic_energy_roundoff_tolerance(
+            old_energy,
+            new_energy,
+            old_node_count=len(old_velocities),
+            new_node_count=len(velocities),
+        )
+        if new_energy - old_energy > energy_tolerance:
+            return None
+        if not math.isfinite(fidelity) or fidelity < 0.0 or fidelity > 1.0:
+            return None
+        return _VelocityTransferResult(
+            velocities=velocities,
+            fidelity=fidelity,
+            old_lumped_kinetic_energy_per_linear_density_m3_s2=old_energy,
+            new_lumped_kinetic_energy_per_linear_density_m3_s2=new_energy,
+        )
+
+    tolerance = _kinetic_energy_roundoff_tolerance(
+        old_energy,
+        closest_energy,
+        old_node_count=len(old_velocities),
+        new_node_count=len(closest),
+    )
+    if closest_energy <= old_energy + tolerance:
+        return validated_result(closest, fidelity=1.0)
+
+    new_tributaries = _node_tributary_lengths(new_rest_lengths)
+    free_mass = math.fsum(new_tributaries[1:-1])
+    if free_mass <= _MIN_MASS:
+        return None
+    old_momentum = _lumped_material_momentum(old_velocities, old_rest_lengths)
+    fixed_endpoint_momentum = _add(
+        _mul(closest[0], new_tributaries[0]),
+        _mul(closest[-1], new_tributaries[-1]),
+    )
+    minimum_free_velocity = _mul(
+        _sub(old_momentum, fixed_endpoint_momentum),
+        1.0 / free_mass,
+    )
+    minimum_energy_field = [
+        closest[0],
+        *(minimum_free_velocity for _ in closest[1:-1]),
+        closest[-1],
+    ]
+
+    def momentum_corrected_blend(fidelity: float) -> list[Vector3]:
+        blended = [
+            closest[0],
+            *(
+                _add(
+                    minimum_free_velocity,
+                    _mul(_sub(reference, minimum_free_velocity), fidelity),
+                )
+                for reference in closest[1:-1]
+            ),
+            closest[-1],
+        ]
+        momentum_error = _sub(
+            old_momentum,
+            _lumped_material_momentum(blended, new_rest_lengths),
+        )
+        correction = _mul(momentum_error, 1.0 / free_mass)
+        for index in range(1, len(blended) - 1):
+            blended[index] = _add(blended[index], correction)
+        return blended
+
+    minimum_energy_field = momentum_corrected_blend(0.0)
+    minimum_energy = _lumped_structural_kinetic_energy_per_linear_density(
+        minimum_energy_field,
+        new_rest_lengths,
+    )
+    minimum_tolerance = _kinetic_energy_roundoff_tolerance(
+        old_energy,
+        minimum_energy,
+        old_node_count=len(old_velocities),
+        new_node_count=len(minimum_energy_field),
+    )
+    if minimum_energy > old_energy + minimum_tolerance:
+        return None
+
+    accepted = minimum_energy_field
+    lower = 0.0
+    upper = 1.0
+    for _ in range(64):
+        middle = 0.5 * (lower + upper)
+        candidate = momentum_corrected_blend(middle)
+        candidate_energy = _lumped_structural_kinetic_energy_per_linear_density(
+            candidate,
+            new_rest_lengths,
+        )
+        candidate_tolerance = _kinetic_energy_roundoff_tolerance(
+            old_energy,
+            candidate_energy,
+            old_node_count=len(old_velocities),
+            new_node_count=len(candidate),
+        )
+        if candidate_energy <= old_energy + candidate_tolerance:
+            accepted = candidate
+            lower = middle
+        else:
+            upper = middle
+    return validated_result(accepted, fidelity=lower)
 
 
 def _lumped_material_momentum(
@@ -4212,6 +5895,30 @@ def _kinetic_energy_roundoff_tolerance(
     tolerance = operation_bound * math.ulp(energy_scale)
     if not math.isfinite(tolerance) or tolerance < 0.0:
         raise ValueError("kinetic-energy roundoff tolerance must be finite and non-negative")
+    return tolerance
+
+
+def _momentum_roundoff_tolerance(
+    old_momentum: Vector3,
+    new_momentum: Vector3,
+    *,
+    old_node_count: int,
+    new_node_count: int,
+) -> float:
+    """估计两次三维集中动量积分及比较的舍入误差上界。"""
+
+    if old_node_count <= 0 or new_node_count <= 0:
+        raise ValueError("momentum node counts must be positive")
+    if not all(math.isfinite(value) for value in (*old_momentum, *new_momentum)):
+        raise ValueError("momenta must be finite")
+    scale = max(
+        1.0,
+        *(abs(value) for value in (*old_momentum, *new_momentum)),
+    )
+    operation_bound = 8 * (old_node_count + new_node_count) + 4
+    tolerance = 2.0 * operation_bound * math.ulp(scale)
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("momentum roundoff tolerance must be finite and non-negative")
     return tolerance
 
 
@@ -5716,6 +7423,230 @@ def _validate_state(state: DynamicLayingState) -> None:
     ):
         if not math.isfinite(value):
             raise ValueError(f"{name} must be finite")
+    if (
+        isinstance(state.material_remap_event_count_cumulative, bool)
+        or not isinstance(state.material_remap_event_count_cumulative, int)
+        or state.material_remap_event_count_cumulative < 0
+    ):
+        raise ValueError("cumulative uniform-ALE remap event count must be a non-negative integer")
+    for name, value in (
+        (
+            "positive cumulative uniform-ALE remap energy",
+            state.material_remap_energy_positive_cumulative_per_linear_density_m3_s2,
+        ),
+        (
+            "negative cumulative uniform-ALE remap energy",
+            state.material_remap_energy_negative_cumulative_per_linear_density_m3_s2,
+        ),
+        (
+            "absolute cumulative uniform-ALE remap energy",
+            state.material_remap_energy_absolute_cumulative_per_linear_density_m3_s2,
+        ),
+    ):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+    uniform_positive = state.material_remap_energy_positive_cumulative_per_linear_density_m3_s2
+    uniform_negative = state.material_remap_energy_negative_cumulative_per_linear_density_m3_s2
+    uniform_absolute = state.material_remap_energy_absolute_cumulative_per_linear_density_m3_s2
+    uniform_signed = state.material_remap_energy_error_cumulative_per_linear_density_m3_s2
+    if uniform_positive < 0.0 or uniform_negative > 0.0 or uniform_absolute < 0.0:
+        raise ValueError("uniform-ALE remap energy decomposition has invalid signs")
+    decomposition = state.uniform_ale_remap_decomposition
+    uniform_scale = max(
+        abs(uniform_signed),
+        abs(uniform_positive),
+        abs(uniform_negative),
+        uniform_absolute,
+        *(
+            abs(value)
+            for component in (
+                decomposition.free,
+                decomposition.constraint,
+                decomposition.total,
+            )
+            for value in (
+                component.signed_per_linear_density_m3_s2,
+                component.positive_per_linear_density_m3_s2,
+                component.negative_per_linear_density_m3_s2,
+                component.absolute_per_linear_density_m3_s2,
+            )
+        ),
+        1.0,
+    )
+    uniform_tolerance = 128.0 * max(1, state.material_remap_event_count_cumulative) * math.ulp(
+        uniform_scale
+    )
+    if abs(uniform_signed - (uniform_positive + uniform_negative)) > uniform_tolerance:
+        raise ValueError("uniform-ALE signed energy does not match positive plus negative")
+    if abs(uniform_absolute - (uniform_positive - uniform_negative)) > uniform_tolerance:
+        raise ValueError("uniform-ALE absolute energy does not match total variation")
+    if state.material_remap_event_count_cumulative == 0 and uniform_absolute != 0.0:
+        raise ValueError("uniform-ALE energy audit cannot be nonzero without an event")
+    if decomposition.event_count_cumulative != state.material_remap_event_count_cumulative:
+        raise ValueError("uniform-ALE decomposition event count does not match compatibility audit")
+    for label, component in (
+        ("free", decomposition.free),
+        ("constraint", decomposition.constraint),
+        ("total", decomposition.total),
+    ):
+        values = (
+            component.signed_per_linear_density_m3_s2,
+            component.positive_per_linear_density_m3_s2,
+            component.negative_per_linear_density_m3_s2,
+            component.absolute_per_linear_density_m3_s2,
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f"uniform-ALE {label} decomposition must be finite")
+        signed, positive, negative, absolute = values
+        if positive < 0.0 or negative > 0.0 or absolute < 0.0:
+            raise ValueError(f"uniform-ALE {label} decomposition has invalid signs")
+        if abs(signed - (positive + negative)) > uniform_tolerance:
+            raise ValueError(f"uniform-ALE {label} signed decomposition does not close")
+        if abs(absolute - (positive - negative)) > uniform_tolerance:
+            raise ValueError(f"uniform-ALE {label} absolute decomposition does not close")
+    if abs(
+        decomposition.total.signed_per_linear_density_m3_s2
+        - math.fsum((
+            decomposition.free.signed_per_linear_density_m3_s2,
+            decomposition.constraint.signed_per_linear_density_m3_s2,
+        ))
+    ) > uniform_tolerance:
+        raise ValueError("uniform-ALE cumulative free plus constraint does not equal total")
+    compatibility_values = (
+        decomposition.total.signed_per_linear_density_m3_s2,
+        decomposition.total.positive_per_linear_density_m3_s2,
+        decomposition.total.negative_per_linear_density_m3_s2,
+        decomposition.total.absolute_per_linear_density_m3_s2,
+    )
+    if any(
+        abs(left - right) > uniform_tolerance
+        for left, right in zip(
+            compatibility_values,
+            (uniform_signed, uniform_positive, uniform_negative, uniform_absolute),
+        )
+    ):
+        raise ValueError("uniform-ALE total decomposition does not match compatibility audit")
+    if not all(
+        math.isfinite(component)
+        for vector in (
+            decomposition.free_left_endpoint_velocity_residual_mps,
+            decomposition.free_right_endpoint_velocity_residual_mps,
+            decomposition.free_momentum_residual_per_linear_density_m2_s,
+            decomposition.last_left_endpoint_material_velocity_mps,
+            decomposition.last_right_endpoint_material_velocity_mps,
+            decomposition.last_target_momentum_per_linear_density_m2_s,
+        )
+        for component in vector
+    ):
+        raise ValueError("uniform-ALE free-field residuals must be finite")
+    latest_energies = (
+        decomposition.last_cell_kinetic_energy_per_linear_density_m3_s2,
+        decomposition.last_free_kinetic_energy_per_linear_density_m3_s2,
+        decomposition.last_resolved_kinetic_energy_per_linear_density_m3_s2,
+    )
+    if not all(math.isfinite(value) and value >= 0.0 for value in latest_energies):
+        raise ValueError("uniform-ALE latest event energies must be finite and non-negative")
+    if decomposition.event_count_cumulative > 0:
+        cell_energy, free_energy, resolved_energy = latest_energies
+        latest_deltas = (
+            decomposition.last_delta_free_per_linear_density_m3_s2,
+            decomposition.last_delta_constraint_per_linear_density_m3_s2,
+            decomposition.last_delta_total_per_linear_density_m3_s2,
+        )
+        if not all(math.isfinite(value) for value in latest_deltas):
+            raise ValueError("uniform-ALE latest event deltas must be finite")
+        latest_tolerance = 128.0 * math.ulp(max(*latest_energies, *(abs(v) for v in latest_deltas), 1.0))
+        if abs((free_energy - cell_energy) - latest_deltas[0]) > latest_tolerance:
+            raise ValueError("uniform-ALE latest free energy does not match event audit")
+        if abs((resolved_energy - free_energy) - latest_deltas[1]) > latest_tolerance:
+            raise ValueError("uniform-ALE latest constraint energy does not match event audit")
+        if abs((resolved_energy - cell_energy) - latest_deltas[2]) > latest_tolerance:
+            raise ValueError("uniform-ALE latest total energy does not match event audit")
+    for name, value in (
+        ("tail remesh event count", state.tail_remesh_event_count),
+        ("cumulative tail remesh event count", state.tail_remesh_event_count_cumulative),
+        ("tail remesh selected window", state.tail_remesh_selected_window_segments),
+        ("tail remesh maximum window", state.tail_remesh_max_window_segments),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    if state.tail_remesh_event_count > state.tail_remesh_event_count_cumulative:
+        raise ValueError("tail remesh current event count cannot exceed cumulative count")
+    if not 0 <= state.tail_remesh_selected_window_segments <= _MAX_LOCAL_TAIL_REMESH_WINDOW_SEGMENTS:
+        raise ValueError("tail remesh selected window lies outside the local safety policy")
+    if not 0 <= state.tail_remesh_max_window_segments <= _MAX_LOCAL_TAIL_REMESH_WINDOW_SEGMENTS:
+        raise ValueError("tail remesh maximum window lies outside the local safety policy")
+    if state.tail_remesh_selected_window_segments > state.tail_remesh_max_window_segments:
+        raise ValueError("tail remesh selected window cannot exceed the cumulative maximum")
+    for name, value in (
+        ("tail remesh velocity fidelity", state.tail_remesh_velocity_fidelity),
+        ("tail remesh minimum velocity fidelity", state.tail_remesh_min_velocity_fidelity),
+    ):
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be finite and within [0, 1]")
+    if state.tail_remesh_min_velocity_fidelity > state.tail_remesh_velocity_fidelity:
+        raise ValueError("tail remesh minimum fidelity cannot exceed the current fidelity")
+    for name, value in (
+        (
+            "tail remesh lumped kinetic-energy delta",
+            state.tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2,
+        ),
+        (
+            "cumulative tail remesh lumped kinetic-energy delta",
+            state.tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2,
+        ),
+        (
+            "absolute cumulative tail remesh lumped kinetic-energy delta",
+            state.tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2,
+        ),
+        (
+            "positive cumulative tail remesh lumped kinetic-energy delta",
+            state.tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2,
+        ),
+        (
+            "negative cumulative tail remesh lumped kinetic-energy delta",
+            state.tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2,
+        ),
+    ):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+    tail_signed = state.tail_remesh_lumped_kinetic_energy_delta_cumulative_per_linear_density_m3_s2
+    tail_absolute = (
+        state.tail_remesh_lumped_kinetic_energy_absolute_cumulative_per_linear_density_m3_s2
+    )
+    tail_positive = (
+        state.tail_remesh_lumped_kinetic_energy_positive_cumulative_per_linear_density_m3_s2
+    )
+    tail_negative = (
+        state.tail_remesh_lumped_kinetic_energy_negative_cumulative_per_linear_density_m3_s2
+    )
+    if tail_absolute < 0.0 or tail_positive < 0.0 or tail_negative > 0.0:
+        raise ValueError("tail remesh energy decomposition has invalid signs")
+    tail_tolerance = 128.0 * max(1, state.tail_remesh_event_count_cumulative) * math.ulp(
+        max(abs(tail_signed), tail_absolute, 1.0)
+    )
+    if abs(tail_signed) > tail_absolute + tail_tolerance:
+        raise ValueError("tail remesh absolute energy cannot be smaller than signed magnitude")
+    if abs(tail_signed - (tail_positive + tail_negative)) > tail_tolerance:
+        raise ValueError("tail remesh signed energy does not match positive plus negative")
+    if abs(tail_absolute - (tail_positive - tail_negative)) > tail_tolerance:
+        raise ValueError("tail remesh absolute energy does not match total variation")
+    if state.tail_remesh_event_count == 0:
+        if state.tail_remesh_selected_window_segments != 0:
+            raise ValueError("tail remesh selected window must be zero without a current event")
+        if state.tail_remesh_velocity_fidelity != 1.0:
+            raise ValueError("tail remesh current fidelity must be one without a current event")
+        if state.tail_remesh_lumped_kinetic_energy_delta_per_linear_density_m3_s2 != 0.0:
+            raise ValueError("tail remesh current energy delta must be zero without a current event")
+    elif state.tail_remesh_selected_window_segments < 3:
+        raise ValueError("tail remesh selected window must contain at least three segments")
+    if state.tail_remesh_event_count_cumulative == 0:
+        if state.tail_remesh_max_window_segments != 0:
+            raise ValueError("tail remesh maximum window must be zero without any event")
+        if state.tail_remesh_min_velocity_fidelity != 1.0:
+            raise ValueError("tail remesh minimum fidelity must be one without any event")
+        if tail_absolute != 0.0:
+            raise ValueError("tail remesh absolute energy must be zero without any event")
     control = state.known_plough_material_control_volume
     if control is not None:
         for name, length in (

@@ -1,50 +1,65 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Realtime Session Initialization v1",
-  "description": "Engineering material, environment, initial geometry and the sequence=0 measurement packet.",
+  "description": "Engineering material, initial material length and the sequence=0 measurement packet.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["cable", "environment", "initial_geometry", "initial_packet"],
+  "required": ["cable", "initial_geometry", "initial_packet"],
   "properties": {
     "cable": {
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "name",
         "diameter_m",
         "mass_air_kg_per_m",
+        "submerged_weight_n_per_m",
         "tangential_drag_coefficient",
         "normal_drag_coefficient",
         "axial_stiffness_n"
       ],
       "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "\\S",
+          "description": "Operator-supplied cable product/project name; metadata only."
+        },
         "diameter_m": {"type": "number", "exclusiveMinimum": 0},
         "mass_air_kg_per_m": {"type": "number", "exclusiveMinimum": 0},
+        "submerged_weight_n_per_m": {"type": "number", "exclusiveMinimum": 0},
         "tangential_drag_coefficient": {"type": "number", "minimum": 0},
         "normal_drag_coefficient": {"type": "number", "minimum": 0},
         "axial_stiffness_n": {"type": "number", "exclusiveMinimum": 0},
-        "min_bending_radius_m": {"type": "number", "exclusiveMinimum": 0}
+        "bending_stiffness_n_m2": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Effective EI used by the discrete bending-energy constraint; 0 or omission preserves the axial-only path."
+        }
       }
     },
-    "environment": {
+    "manufacturer_limits": {
       "type": "object",
+      "description": "Optional manufacturer reference values echoed in results; never solver constraints.",
       "additionalProperties": false,
-      "required": ["water_depth_m"],
       "properties": {
-        "water_depth_m": {"type": "number", "exclusiveMinimum": 0}
+        "installation_lc_mbr_m": {"type": "number", "exclusiveMinimum": 0},
+        "normal_operation_lc_mbr_m": {"type": "number", "exclusiveMinimum": 0},
+        "storage_dc_mbr_m": {"type": "number", "exclusiveMinimum": 0},
+        "installation_dc_mbr_m": {"type": "number", "exclusiveMinimum": 0},
+        "maximum_working_load_n": {"type": "number", "exclusiveMinimum": 0},
+        "maximum_abnormal_operation_load_n": {"type": "number", "exclusiveMinimum": 0},
+        "dwp_breaking_load_n": {"type": "number", "exclusiveMinimum": 0}
       }
     },
     "initial_geometry": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "initial_suspended_length_m",
-        "plough_layback_m",
-        "plough_depth_m"
-      ],
+      "required": ["initial_suspended_length_m", "plough_position_mode"],
       "properties": {
         "initial_suspended_length_m": {"type": "number", "exclusiveMinimum": 0},
-        "plough_layback_m": {"type": "number", "minimum": 0},
-        "plough_depth_m": {"type": "number", "exclusiveMinimum": 0}
+        "plough_position_mode": {"type": "string", "enum": ["measured", "reconstructed"]}
       }
     },
     "initial_packet": {

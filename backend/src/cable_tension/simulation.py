@@ -288,6 +288,7 @@ class DynamicCaseInput:
     tangential_drag_coefficient: float = _DEFAULT_DYNAMIC_CABLE.tangential_drag_coefficient
     normal_drag_coefficient: float = _DEFAULT_DYNAMIC_CABLE.normal_drag_coefficient
     axial_stiffness_n: float = _DEFAULT_DYNAMIC_CABLE.axial_stiffness_n
+    bending_stiffness_n_m2: float = _DEFAULT_DYNAMIC_CABLE.bending_stiffness_n_m2
     element_count: int = 32
     total_duration_s: float = 360.0
     current_direction_deg: float = 90.0
@@ -405,6 +406,7 @@ def cable_parameters_from_dynamic_case(case: DynamicCaseInput) -> CableParameter
         tangential_drag_coefficient=case.tangential_drag_coefficient,
         normal_drag_coefficient=case.normal_drag_coefficient,
         axial_stiffness_n=case.axial_stiffness_n,
+        bending_stiffness_n_m2=case.bending_stiffness_n_m2,
         min_bending_radius_m=case.min_bending_radius_m,
     )
 
@@ -450,6 +452,7 @@ def validate_dynamic_case(
         "vessel_final_speed_mps": case.vessel_final_speed_mps,
         "tangential_drag_coefficient": case.tangential_drag_coefficient,
         "normal_drag_coefficient": case.normal_drag_coefficient,
+        "bending_stiffness_n_m2": case.bending_stiffness_n_m2,
     }
     optional_nonnegative_values = {
         "current_bottom_speed_mps": case.current_bottom_speed_mps,

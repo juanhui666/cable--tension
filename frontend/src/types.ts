@@ -339,6 +339,7 @@ export interface RealtimeEndpointSample {
 export interface RealtimeSensorPacket {
   sequence: number;
   time_s: number;
+  water_depth_m: number;
   vessel: RealtimeEndpointSample;
   payout_speed_mps: number;
   surface_current: {
@@ -346,38 +347,59 @@ export interface RealtimeSensorPacket {
     velocity_y_mps: number;
   };
   plough_position?: Pick<RealtimeEndpointSample, "x_m" | "y_m" | "z_m">;
+  plough_horizontal_distance_m?: number;
+  plough_bearing_deg?: number;
+  plough_inlet_height_above_seabed_m?: number;
   measured_top_tension_n?: number;
 }
 
 export type RealtimeSensorPacketDraft = RealtimeSensorPacket;
 
+export type PloughPositionMode = "measured" | "reconstructed";
+
 export interface RealtimeStaticForm {
+  cable_name: string;
   diameter_m: number;
-  weight_air_n_per_m: number;
+  mass_air_kg_per_m: number;
+  submerged_weight_n_per_m: number;
   tangential_drag_coefficient: number;
   normal_drag_coefficient: number;
   axial_stiffness_n: number;
-  water_depth_m: number;
+  bending_stiffness_n_m2: number;
   initial_suspended_length_m: number;
-  plough_layback_m: number;
-  plough_depth_m: number;
-  min_bending_radius_m: number | null;
+  plough_position_mode: PloughPositionMode;
+  installation_lc_mbr_m: number | null;
+  normal_operation_lc_mbr_m: number | null;
+  storage_dc_mbr_m: number | null;
+  installation_dc_mbr_m: number | null;
+  maximum_working_load_n: number | null;
+  maximum_abnormal_operation_load_n: number | null;
+  dwp_breaking_load_n: number | null;
 }
 
 export interface CreateRealtimeSessionRequest {
   cable: {
+    name: string;
     diameter_m: number;
     mass_air_kg_per_m: number;
+    submerged_weight_n_per_m: number;
     tangential_drag_coefficient: number;
     normal_drag_coefficient: number;
     axial_stiffness_n: number;
-    min_bending_radius_m?: number;
+    bending_stiffness_n_m2?: number;
   };
-  environment: { water_depth_m: number };
+  manufacturer_limits?: {
+    installation_lc_mbr_m?: number;
+    normal_operation_lc_mbr_m?: number;
+    storage_dc_mbr_m?: number;
+    installation_dc_mbr_m?: number;
+    maximum_working_load_n?: number;
+    maximum_abnormal_operation_load_n?: number;
+    dwp_breaking_load_n?: number;
+  };
   initial_geometry: {
     initial_suspended_length_m: number;
-    plough_layback_m: number;
-    plough_depth_m: number;
+    plough_position_mode: PloughPositionMode;
   };
   initial_packet: RealtimeSensorPacket;
 }
@@ -386,6 +408,7 @@ export interface RealtimeFrameResponse {
   session_id: string;
   sequence: number;
   time_s: number;
+  cable: { name: string };
   cable_shape: {
     points: Array<{ index: number; x_m: number; y_m: number; z_m: number }>;
     segment_tensions_n: number[];
@@ -396,11 +419,27 @@ export interface RealtimeFrameResponse {
     measured_top_tension_n: number | null;
     top_tension_residual_n: number | null;
   };
+  vessel_departure_angles: {
+    horizontal_deg: number;
+    vertical_deg: number;
+  };
   minimum_bend_radius: {
     minimum_m: number | null;
-    limit_m: number | null;
-    margin_m: number | null;
-    status: "not_configured" | "not_available" | "ok" | "below_limit";
+  };
+  bending: {
+    effective_stiffness_n_m2: number;
+    maximum_curvature_per_m: number | null;
+    minimum_curvature_radius_m: number | null;
+    maximum_moment_n_m: number | null;
+  };
+  manufacturer_limits: {
+    installation_lc_mbr_m: number | null;
+    normal_operation_lc_mbr_m: number | null;
+    storage_dc_mbr_m: number | null;
+    installation_dc_mbr_m: number | null;
+    maximum_working_load_n: number | null;
+    maximum_abnormal_operation_load_n: number | null;
+    dwp_breaking_load_n: number | null;
   };
   runtime: {
     compute_wall_s: number;

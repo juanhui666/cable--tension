@@ -4,7 +4,7 @@ import { advanceRealtimeSession, ApiError, createRealtimeSession, DEFAULT_API_BA
 import { RealtimeParameterPanel } from "./RealtimeParameterPanel";
 import { RealtimeResultView } from "./RealtimeResultView";
 import { DEFAULT_REALTIME_FORM } from "./simulationConfig";
-import { parseRealtimeCsv, type RealtimeCsvDataset } from "./realtimeCsv";
+import { parseRealtimeCsv, validateRealtimeDatasetMode, type RealtimeCsvDataset } from "./realtimeCsv";
 import { realtimePlaybackDeadlineMs, realtimeScheduleDelayMs } from "./realtimeSchedule";
 import type {
   CreateRealtimeSessionRequest,
@@ -12,6 +12,7 @@ import type {
   RealtimeFrameResponse,
   RealtimeSensorPacket,
   RealtimeStaticForm,
+  PloughPositionMode,
 } from "./types";
 import "./styles.css";
 
@@ -205,6 +206,7 @@ export default function App() {
     setError(null);
     try {
       const nextDataset = parseRealtimeCsv(await file.text(), file.name);
+      validateRealtimeDatasetMode(nextDataset, form.plough_position_mode);
       if (loadGeneration !== datasetLoadGenerationRef.current) return;
       setDataset(nextDataset);
       clearSessionState();
@@ -213,6 +215,12 @@ export default function App() {
     } finally {
       if (loadGeneration === datasetLoadGenerationRef.current) setBusy(false);
     }
+  }
+
+  function changePloughPositionMode(mode: PloughPositionMode) {
+    setForm((current) => ({ ...current, plough_position_mode: mode }));
+    setDataset(null);
+    clearSessionState();
   }
 
   const completed = Boolean(dataset && index >= dataset.rows.length - 1);
@@ -238,13 +246,20 @@ export default function App() {
         form={form}
         onFile={loadFile}
         onFormChange={(field, value) => setForm((current) => ({ ...current, [field]: value }))}
+        onCableNameChange={(value) => setForm((current) => ({ ...current, cable_name: value }))}
+        onPloughPositionModeChange={changePloughPositionMode}
         onReset={reset}
         onStartPause={startOrPause}
         onStep={step}
         onStop={pausePlayback}
         playing={playing}
       />
-      <RealtimeResultView completed={completed} history={history} playing={playing} waterDepthM={form.water_depth_m} />
+      <RealtimeResultView
+        completed={completed}
+        history={history}
+        playing={playing}
+        waterDepthM={dataset?.rows[Math.max(index, 0)]?.water_depth_m ?? 0}
+      />
     </main>
   );
 }
@@ -255,21 +270,37 @@ export function buildRealtimeSessionRequest(
 ): CreateRealtimeSessionRequest {
   return {
     cable: {
+      name: form.cable_name,
       diameter_m: form.diameter_m,
-      mass_air_kg_per_m: form.weight_air_n_per_m / 9.8,
+      mass_air_kg_per_m: form.mass_air_kg_per_m,
+      submerged_weight_n_per_m: form.submerged_weight_n_per_m,
       tangential_drag_coefficient: form.tangential_drag_coefficient,
       normal_drag_coefficient: form.normal_drag_coefficient,
       axial_stiffness_n: form.axial_stiffness_n,
-      ...(form.min_bending_radius_m === null ? {} : { min_bending_radius_m: form.min_bending_radius_m }),
+      bending_stiffness_n_m2: form.bending_stiffness_n_m2,
     },
-    environment: { water_depth_m: form.water_depth_m },
+    manufacturer_limits: compactManufacturerLimits(form),
     initial_geometry: {
       initial_suspended_length_m: form.initial_suspended_length_m,
-      plough_layback_m: form.plough_layback_m,
-      plough_depth_m: form.plough_depth_m,
+      plough_position_mode: form.plough_position_mode,
     },
     initial_packet: initialPacket,
   };
+}
+
+function compactManufacturerLimits(form: RealtimeStaticForm): CreateRealtimeSessionRequest["manufacturer_limits"] {
+  const values = {
+    installation_lc_mbr_m: form.installation_lc_mbr_m,
+    normal_operation_lc_mbr_m: form.normal_operation_lc_mbr_m,
+    storage_dc_mbr_m: form.storage_dc_mbr_m,
+    installation_dc_mbr_m: form.installation_dc_mbr_m,
+    maximum_working_load_n: form.maximum_working_load_n,
+    maximum_abnormal_operation_load_n: form.maximum_abnormal_operation_load_n,
+    dwp_breaking_load_n: form.dwp_breaking_load_n,
+  };
+  return Object.fromEntries(
+    Object.entries(values).filter(([, value]) => value !== null),
+  ) as CreateRealtimeSessionRequest["manufacturer_limits"];
 }
 
 function messageFrom(caught: unknown): string {
